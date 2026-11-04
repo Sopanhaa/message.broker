@@ -1,0 +1,23 @@
+name: order-messaging-system
+services:
+  rabbitmq:
+    image: rabbitmq:4.2-management
+    hostname: rabbitmq
+    ports:
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    environment:
+      # Development credentials only; keep appsettings.json in sync if changed.
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-orderdev}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-orderdev_password}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+volumes:
+  rabbitmq_data:
