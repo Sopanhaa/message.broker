@@ -1,43 +1,50 @@
-# OrderMessagingSystem
+# OrderMessagingSystem — Setup Guide
 
-This project accepts an order through an API and sends it to RabbitMQ. A worker receives the order and prints the processing result in its terminal.
+Follow these steps to run the project on Ubuntu.
 
-```text
-curl / Postman → OrderProducer.Api → RabbitMQ → OrderConsumer.Worker
-```
+The project has three parts:
 
-RabbitMQ runs in Docker. The API and worker run locally with `dotnet run`.
+- **RabbitMQ** stores order messages and runs in Docker.
+- **OrderProducer.Api** receives HTTP requests and sends messages to RabbitMQ.
+- **OrderConsumer.Worker** receives messages and logs the processed orders.
 
-## 1. Check the required tools
+## 1. Check your tools
 
-You need .NET 10 SDK, Docker with Docker Compose, and curl (or Postman).
+Install the **.NET 10 SDK**, **Docker with Docker Compose**, and **curl** before continuing.
+
+Installation guides: [.NET on Ubuntu](https://learn.microsoft.com/en-us/dotnet/core/install/linux-ubuntu-install) · [Docker on Ubuntu](https://docs.docker.com/engine/install/ubuntu/).
+
+Check that they are available:
 
 ```bash
 dotnet --version
 docker --version
 docker compose version
+curl --version
 ```
 
-The .NET SDK version should start with `10.`. If a tool is missing, see the [.NET installation guide](https://learn.microsoft.com/en-us/dotnet/core/install/linux-ubuntu-install) or [Docker installation guide](https://docs.docker.com/engine/install/ubuntu/).
+The .NET version should start with `10.`.
 
-## 2. Open the project folder
+## 2. Open the solution folder
 
-From the repository folder (`message.broker`), run:
+Open a terminal in the folder containing `OrderMessagingSystem.slnx` and `docker-compose.yml`.
+
+If you are in the parent `message.broker` folder, run:
 
 ```bash
 cd OrderMessagingSystem
 ```
 
-You should see `OrderMessagingSystem.slnx` and `docker-compose.yml` in this folder. Run all commands below from this folder, including commands in new terminals.
+If your terminal is already in `OrderMessagingSystem`, stay there. Use this folder for all commands below and for each new terminal.
 
-## 3. Restore and build
+## 3. Build the project
 
 ```bash
 dotnet restore OrderMessagingSystem.slnx
 dotnet build OrderMessagingSystem.slnx --no-restore
 ```
 
-Continue when you see `Build succeeded`.
+Wait for `Build succeeded` before continuing.
 
 ## 4. Start RabbitMQ
 
@@ -46,134 +53,123 @@ sudo docker compose up -d --wait
 sudo docker compose ps
 ```
 
-The first start downloads RabbitMQ and may take a few minutes. Wait until the container shows `healthy`.
+The first run downloads the RabbitMQ image. Wait until the container status shows `healthy`.
 
-If your account already has Docker access, you can omit `sudo`.
+You can omit `sudo` if your account already has Docker access.
 
-The project already includes matching development connection settings in both applications' `appsettings.json` files:
+Open **http://localhost:15672** and log in:
 
-| Setting | Value |
+| Username | Password |
 | --- | --- |
-| Host | `localhost` |
-| AMQP port | `5672` |
-| Username | `orderdev` |
-| Password | `orderdev_password` |
-| Queue | `orders` |
+| `orderdev` | `orderdev_password` |
 
-You do not need to change these settings for the default setup.
+Both applications are already configured to connect to `localhost:5672` with these development credentials. No configuration changes are needed for this setup.
 
-## 5. Start the consumer
-
-In **terminal 1**, run:
+## 5. Run the consumer — terminal 1
 
 ```bash
 dotnet run --project OrderConsumer.Worker
 ```
 
-Wait for a log message starting with `Waiting for orders in orders`. Leave this terminal running.
+Wait for `Waiting for orders in orders`. Keep this terminal running.
 
-## 6. Start the API
+## 6. Run the API — terminal 2
 
-Open **terminal 2** in the same project folder and run:
+Open another terminal in the solution folder:
 
 ```bash
 dotnet run --project OrderProducer.Api
 ```
 
-The API starts at **http://localhost:5000**. Leave this terminal running too.
+Keep it running. The API URL is **http://localhost:5000**.
 
-## 7. Send an order
+## 7. Send an order — terminal 3
 
-Open **terminal 3** and run:
+Check that the API is running:
 
 ```bash
-curl -i http://localhost:5000/orders \
+curl http://localhost:5000/health
+```
+
+Send an order:
+
+```bash
+curl -i -X POST http://localhost:5000/orders \
   -H 'Content-Type: application/json' \
   -d '{"customerName":"Sopanha","totalAmount":50.00}'
 ```
 
-For Postman, use **POST**, URL `http://localhost:5000/orders`, and **Body → raw → JSON** with the same JSON data.
+You should receive **HTTP 202 Accepted**, with an `orderId` in the response. This means RabbitMQ accepted the message.
 
-You should receive **202 Accepted** and a generated `orderId`. This means RabbitMQ accepted the message for processing.
-
-Look at **terminal 1** for output similar to:
+In **terminal 1**, you should see:
 
 ```text
 Processing order <orderId>: customer=Sopanha, total=50.00
 Processed and acknowledged order <orderId>
 ```
 
-The customer name must contain 1–100 characters after trimming, and the amount must be greater than zero. Invalid data returns `400`.
+You can also send the request using Postman: choose **POST**, enter `http://localhost:5000/orders`, select **Body → raw → JSON**, and use:
 
-## 8. Open the RabbitMQ dashboard
+```json
+{
+  "customerName": "Sopanha",
+  "totalAmount": 50.00
+}
+```
 
-Open **http://localhost:15672** in your browser.
+## 8. Check the queue
 
-- Username: `orderdev`
-- Password: `orderdev_password`
+In the RabbitMQ dashboard, open **Queues and Streams → orders**.
 
-Go to **Queues and Streams** to see `orders` and `orders.dead-letter`. Failed messages are sent to `orders.dead-letter`.
+To see a message waiting:
 
-To see messages waiting in `orders`, stop the consumer with `Ctrl+C`, send another order, and refresh the dashboard. Start the consumer again to process the waiting message.
+1. Stop the consumer in terminal 1 with `Ctrl+C`.
+2. Send another order using the same curl command.
+3. Refresh the dashboard. The queue should show a ready message.
+4. Run `dotnet run --project OrderConsumer.Worker` again. The worker processes the waiting message.
 
 ## 9. Run tests (optional)
 
-Run the API tests:
+From the solution folder:
 
 ```bash
 dotnet test OrderMessagingSystem.slnx
 ```
 
+These API tests can run without RabbitMQ.
+
 ## 10. Stop the project
 
-Press `Ctrl+C` in the API and consumer terminals. Then stop RabbitMQ:
+Press `Ctrl+C` in the API and consumer terminals. Then run:
 
 ```bash
 sudo docker compose down
 ```
 
-The RabbitMQ data volume is kept, so stored messages remain available the next time you run `sudo docker compose up -d --wait`.
+This keeps RabbitMQ's stored data. To start the project again, repeat steps 4–6.
 
-## Common setup problems
+## Setup problems
 
-### Docker: permission denied
+**Docker says permission denied:** use `sudo docker compose up -d --wait`.
 
-Use `sudo` before the Docker command:
-
-```bash
-sudo docker compose up -d --wait
-```
-
-### Port 5672 is already in use
-
-Another service or container is using RabbitMQ's port. Find it:
+**Port 5672 is already in use:** check which service or container owns it:
 
 ```bash
 sudo ss -ltnp 'sport = :5672'
 sudo docker ps --filter publish=5672
 ```
 
-If it is an old container you no longer need, stop it using its name or ID:
+If an old container is using it and you no longer need that container, stop it with `sudo docker stop CONTAINER_NAME`, replacing `CONTAINER_NAME` with the name shown above.
 
-```bash
-sudo docker stop <container-name-or-id>
-```
+If RabbitMQ is installed directly on Ubuntu and you want to replace it with this project's container, stop that service with `sudo systemctl stop rabbitmq-server`. Stop it only if other applications do not need it.
 
-If it is RabbitMQ installed directly on Ubuntu and you want to use this project's container instead:
+Then retry `sudo docker compose up -d --wait`.
 
-```bash
-sudo systemctl stop rabbitmq-server
-```
-
-Then retry `sudo docker compose up -d --wait`. Stop the existing service only if it is safe to do so.
-
-### API returns 503 or the worker cannot connect
-
-Check that RabbitMQ is running and healthy:
+**The API returns 503 or the consumer cannot connect:** check RabbitMQ:
 
 ```bash
 sudo docker compose ps
 sudo docker compose logs --tail 50 rabbitmq
 ```
 
-Confirm that both applications' `appsettings.json` files use the connection settings shown in step 4.
+Check that `OrderProducer.Api/appsettings.json` and `OrderConsumer.Worker/appsettings.json` both use host `localhost`, port `5672`, username `orderdev`, and password `orderdev_password`.
