@@ -124,14 +124,6 @@ Run the API tests:
 dotnet test OrderMessagingSystem.slnx
 ```
 
-To test the complete flow with RabbitMQ running, use Python 3:
-
-```bash
-python3 scripts/integration_test.py
-```
-
-This script starts its own API and worker and uses separate test queues.
-
 ## 10. Stop the project
 
 Press `Ctrl+C` in the API and consumer terminals. Then stop RabbitMQ:

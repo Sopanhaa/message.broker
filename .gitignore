@@ -7,4 +7,3 @@ TestResults/
 *.suo
 .env
 *.log
-__pycache__/
