@@ -57,13 +57,13 @@ The first run downloads the RabbitMQ image. Wait until the container status show
 
 You can omit `sudo` if your account already has Docker access.
 
-Open **http://localhost:15672** and log in:
+Open **http://localhost:15673** and log in:
 
 | Username | Password |
 | --- | --- |
 | `orderdev` | `orderdev_password` |
 
-Both applications are already configured to connect to `localhost:5672` with these development credentials. No configuration changes are needed for this setup.
+Both applications are already configured to connect to `localhost:5673` with these development credentials. No configuration changes are needed for this setup.
 
 ## 5. Run the consumer — terminal 1
 
@@ -152,18 +152,35 @@ This keeps RabbitMQ's stored data. To start the project again, repeat steps 4–
 
 **Docker says permission denied:** use `sudo docker compose up -d --wait`.
 
-**Port 5672 is already in use:** check which service or container owns it:
+**RabbitMQ ports:** this project publishes AMQP on `127.0.0.1:5673` and the dashboard on `127.0.0.1:15673`. Inside the container, RabbitMQ still uses ports `5672` and `15672`. The host ports avoid conflicts with other RabbitMQ installations, including the one bundled with OnlyOffice.
+
+After changing port mappings, recreate the container and verify the published AMQP port:
 
 ```bash
-sudo ss -ltnp 'sport = :5672'
-sudo docker ps --filter publish=5672
+sudo docker compose up -d --force-recreate --wait
+sudo docker compose port rabbitmq 5672
 ```
 
-If an old container is using it and you no longer need that container, stop it with `sudo docker stop CONTAINER_NAME`, replacing `CONTAINER_NAME` with the name shown above.
+The last command should print `127.0.0.1:5673`.
 
-If RabbitMQ is installed directly on Ubuntu and you want to replace it with this project's container, stop that service with `sudo systemctl stop rabbitmq-server`. Stop it only if other applications do not need it.
+**`ACCESS_REFUSED` / login refused:** the application reached a broker, but that broker rejected its credentials. First verify the mapping above so the application connects to this project's broker. Then verify the development credentials inside the container:
 
-Then retry `sudo docker compose up -d --wait`.
+```bash
+sudo docker compose exec rabbitmq rabbitmqctl authenticate_user orderdev orderdev_password
+```
+
+If authentication succeeds, check that both applications use host `localhost` and port `5673`. Environment variables such as `RabbitMq__Port`, `RabbitMq__UserName`, and `RabbitMq__Password` override `appsettings.json`.
+
+If authentication fails inside the container, inspect its users and logs:
+
+```bash
+sudo docker compose exec rabbitmq rabbitmqctl list_users
+sudo docker compose logs --tail 50 rabbitmq
+```
+
+RabbitMQ seeds the default user only when its database is first created. Changing `RABBITMQ_DEFAULT_USER` or `RABBITMQ_DEFAULT_PASS` does not update credentials already stored in the `rabbitmq_data` volume. See [RabbitMQ's access control documentation](https://www.rabbitmq.com/docs/access-control).
+
+**Docker contexts:** these commands use `sudo`, which may select a different Docker daemon from your regular account. If `docker compose ps` and `sudo docker compose ps` show different containers, use the same context consistently. For the system Docker daemon, you can use `docker --context default compose ...` if your account has access.
 
 **The API returns 503 or the consumer cannot connect:** check RabbitMQ:
 
@@ -172,4 +189,4 @@ sudo docker compose ps
 sudo docker compose logs --tail 50 rabbitmq
 ```
 
-Check that `OrderProducer.Api/appsettings.json` and `OrderConsumer.Worker/appsettings.json` both use host `localhost`, port `5672`, username `orderdev`, and password `orderdev_password`.
+Check that `OrderProducer.Api/appsettings.json` and `OrderConsumer.Worker/appsettings.json` both use host `localhost`, port `5673`, username `orderdev`, and password `orderdev_password`.

@@ -4,8 +4,8 @@ services:
     image: rabbitmq:4.2-management
     hostname: rabbitmq
     ports:
-      - "127.0.0.1:5672:5672"
-      - "127.0.0.1:15672:15672"
+      - "127.0.0.1:5673:5672"
+      - "127.0.0.1:15673:15672"
     environment:
       # Development credentials only; keep appsettings.json in sync if changed.
       RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-orderdev}
