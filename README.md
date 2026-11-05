@@ -20,10 +20,15 @@ Run these commands one at a time:
 
 ```bash
 dotnet restore OrderMessagingSystem.slnx
+
+```
+```bash 
 dotnet build OrderMessagingSystem.slnx --no-restore
-sudo docker compose up -d --wait
 ```
 
+```bash 
+sudo docker compose up -d --wait
+```
 Wait for **Build succeeded** and for RabbitMQ to show **Healthy**. The first start may take a few minutes.
 
 ## 2. Start the order processor
