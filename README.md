@@ -1,20 +1,17 @@
-# OrderMessagingSystem — Setup Guide
+# Order Messaging System
 
-Follow these steps to run the project on Ubuntu.
+Send an order to an API and watch a background worker process it through RabbitMQ. This guide walks you through running the project locally on Ubuntu.
 
-The project has three parts:
+```text
+curl or Postman → OrderProducer.Api → RabbitMQ → OrderConsumer.Worker
+                 receives the order  queues it  processes and logs it
+```
 
-- **RabbitMQ** stores order messages and runs in Docker.
-- **OrderProducer.Api** receives HTTP requests and sends messages to RabbitMQ.
-- **OrderConsumer.Worker** receives messages and logs the processed orders.
+## Before you start
 
-## 1. Check your tools
+You need **.NET 10 SDK**, **Docker with Docker Compose**, and **curl**.
 
-Install the **.NET 10 SDK**, **Docker with Docker Compose**, and **curl** before continuing.
-
-Installation guides: [.NET on Ubuntu](https://learn.microsoft.com/en-us/dotnet/core/install/linux-ubuntu-install) · [Docker on Ubuntu](https://docs.docker.com/engine/install/ubuntu/).
-
-Check that they are available:
+Check your tools:
 
 ```bash
 dotnet --version
@@ -23,75 +20,93 @@ docker compose version
 curl --version
 ```
 
-The .NET version should start with `10.`.
+The .NET version should start with `10.`. If something is missing, follow the [.NET installation guide](https://learn.microsoft.com/en-us/dotnet/core/install/linux-ubuntu-install) or the [Docker installation guide](https://docs.docker.com/engine/install/ubuntu/).
 
-## 2. Open the solution folder
-
-Open a terminal in the folder containing `OrderMessagingSystem.slnx` and `docker-compose.yml`.
-
-If you are in the parent `message.broker` folder, run:
+Open a terminal in the `OrderMessagingSystem` folder. If you are in the parent `message.broker` folder, run:
 
 ```bash
 cd OrderMessagingSystem
 ```
 
-If your terminal is already in `OrderMessagingSystem`, stay there. Use this folder for all commands below and for each new terminal.
+You should see `OrderMessagingSystem.slnx` and `docker-compose.yml` here. **Run every command below from this folder**, including commands in new terminals.
 
-## 3. Build the project
+## 1. Build the project
 
 ```bash
 dotnet restore OrderMessagingSystem.slnx
 dotnet build OrderMessagingSystem.slnx --no-restore
 ```
 
-Wait for `Build succeeded` before continuing.
+Wait for **Build succeeded** before continuing.
 
-## 4. Start RabbitMQ
+## 2. Start RabbitMQ
 
 ```bash
 sudo docker compose up -d --wait
 sudo docker compose ps
 ```
 
-The first run downloads the RabbitMQ image. Wait until the container status shows `healthy`.
+The first run downloads the RabbitMQ image and may take a little longer. Continue when the container shows **healthy**.
 
-You can omit `sudo` if your account already has Docker access.
+These instructions use `sudo` for Docker commands. If your account already has access to the system Docker daemon, you can omit it. Use the same Docker context throughout; see [Docker permission or context problems](#docker-permission-or-context-problems) if containers appear to be missing.
 
-Open **http://localhost:15673** and log in:
+Your local connection details are:
 
-| Username | Password |
-| --- | --- |
-| `orderdev` | `orderdev_password` |
+| Service | Address | Purpose |
+| --- | --- | --- |
+| Order API | http://localhost:5000 | Send orders and check the API |
+| RabbitMQ dashboard | http://localhost:15673 | View queues and messages |
+| RabbitMQ connection | `localhost:5673` | Used by the API and worker |
 
-Both applications are already configured to connect to `localhost:5673` with these development credentials. No configuration changes are needed for this setup.
+Open the **[RabbitMQ dashboard](http://localhost:15673)** and sign in with username **`orderdev`** and password **`orderdev_password`**. These are development credentials.
 
-## 5. Run the consumer — terminal 1
+Both apps are already configured with these settings. The project uses host ports `5673` and `15673` to avoid conflicts with other RabbitMQ installations, including OnlyOffice.
+
+## 3. Start the consumer — terminal 1
 
 ```bash
 dotnet run --project OrderConsumer.Worker
 ```
 
-Wait for `Waiting for orders in orders`. Keep this terminal running.
+Wait for a log line that starts with:
 
-## 6. Run the API — terminal 2
+```text
+Waiting for orders in orders
+```
 
-Open another terminal in the solution folder:
+**Leave this terminal running.** The consumer waits for messages and logs each order it processes.
+
+## 4. Start the API — terminal 2
+
+Open a second terminal in `OrderMessagingSystem`:
 
 ```bash
 dotnet run --project OrderProducer.Api
 ```
 
-Keep it running. The API URL is **http://localhost:5000**.
+Wait for:
 
-## 7. Send an order — terminal 3
+```text
+Now listening on: http://localhost:5000
+```
 
-Check that the API is running:
+**Leave this terminal running too.**
+
+## 5. Send your first order — terminal 3
+
+Open a third terminal in `OrderMessagingSystem`. First, check the API:
 
 ```bash
 curl http://localhost:5000/health
 ```
 
-Send an order:
+Expected response:
+
+```json
+{"status":"healthy","check":"liveness"}
+```
+
+This confirms the API is running. Sending an order in the next step checks its connection to RabbitMQ.
 
 ```bash
 curl -i -X POST http://localhost:5000/orders \
@@ -99,16 +114,30 @@ curl -i -X POST http://localhost:5000/orders \
   -d '{"customerName":"Sopanha","totalAmount":50.00}'
 ```
 
-You should receive **HTTP 202 Accepted**, with an `orderId` in the response. This means RabbitMQ accepted the message.
+Look for **HTTP 202 Accepted** and a response like this; the ID and timestamp will be different:
 
-In **terminal 1**, you should see:
+```json
+{
+  "orderId": "1f53a5c9-12c0-409d-b051-ec261572a471",
+  "status": "accepted",
+  "createdAtUtc": "2026-11-05T03:26:27.4582817+00:00"
+}
+```
+
+`202` means RabbitMQ accepted the order. Check **terminal 1** to confirm the consumer finished processing it:
 
 ```text
 Processing order <orderId>: customer=Sopanha, total=50.00
 Processed and acknowledged order <orderId>
 ```
 
-You can also send the request using Postman: choose **POST**, enter `http://localhost:5000/orders`, select **Body → raw → JSON**, and use:
+The displayed amount may be `50` or `50.00`.
+
+### Prefer Postman?
+
+1. Create a **POST** request to `http://localhost:5000/orders`.
+2. Select **Body → raw → JSON**.
+3. Paste the following body and click **Send**:
 
 ```json
 {
@@ -117,20 +146,45 @@ You can also send the request using Postman: choose **POST**, enter `http://loca
 }
 ```
 
-## 8. Check the queue
+Check for **202 Accepted**, then look at the consumer terminal for the processing logs.
 
-In the RabbitMQ dashboard, open **Queues and Streams → orders**.
+## See messages in the dashboard
 
-To see a message waiting:
+Open the [RabbitMQ dashboard](http://localhost:15673), then select **Queues and Streams → orders**. The queue appears after the consumer connects or the API publishes its first order.
 
-1. Stop the consumer in terminal 1 with `Ctrl+C`.
-2. Send another order using the same curl command.
-3. Refresh the dashboard. The queue should show a ready message.
-4. Run `dotnet run --project OrderConsumer.Worker` again. The worker processes the waiting message.
+The consumer processes messages quickly, so an empty queue after sending an order is normal. To watch a message wait in the queue:
 
-## 9. Run tests (optional)
+1. Stop the consumer in terminal 1 with **Ctrl+C**. Keep the API running.
+2. Send another order from terminal 3.
+3. Refresh the dashboard. The `orders` queue should show a **Ready** message.
+4. Start the consumer again with `dotnet run --project OrderConsumer.Worker`.
+5. Watch the consumer logs. The message disappears from the queue after it is processed and acknowledged.
 
-From the solution folder:
+## Stop and restart
+
+To stop, press **Ctrl+C** in the API and consumer terminals, then run:
+
+```bash
+sudo docker compose down
+```
+
+This keeps RabbitMQ's stored data, including queued messages.
+
+Next time, start RabbitMQ:
+
+```bash
+sudo docker compose up -d --wait
+```
+
+Then run each app in its own terminal:
+
+| Terminal | Command |
+| --- | --- |
+| 1 — Consumer | `dotnet run --project OrderConsumer.Worker` |
+| 2 — API | `dotnet run --project OrderProducer.Api` |
+| 3 — Requests | Use the curl commands in step 5 |
+
+## Run the automated tests
 
 ```bash
 dotnet test OrderMessagingSystem.slnx
@@ -138,55 +192,89 @@ dotnet test OrderMessagingSystem.slnx
 
 These API tests can run without RabbitMQ.
 
-## 10. Stop the project
+## Troubleshooting
 
-Press `Ctrl+C` in the API and consumer terminals. Then run:
+### The API does not respond
 
-```bash
-sudo docker compose down
-```
+Make sure terminal 2 is still running and shows `Now listening on: http://localhost:5000`. Use `http`, and check that the URL includes port `5000`.
 
-This keeps RabbitMQ's stored data. To start the project again, repeat steps 4–6.
+### The API returns 400
 
-## Setup problems
+Check your JSON. Use a nonempty `customerName` of at most 100 characters and a `totalAmount` greater than zero. Include the `Content-Type: application/json` header, as shown in step 5.
 
-**Docker says permission denied:** use `sudo docker compose up -d --wait`.
+### The API returns 503 or the consumer keeps reconnecting
 
-**RabbitMQ ports:** this project publishes AMQP on `127.0.0.1:5673` and the dashboard on `127.0.0.1:15673`. Inside the container, RabbitMQ still uses ports `5672` and `15672`. The host ports avoid conflicts with other RabbitMQ installations, including the one bundled with OnlyOffice.
-
-After changing port mappings, recreate the container and verify the published AMQP port:
-
-```bash
-sudo docker compose up -d --force-recreate --wait
-sudo docker compose port rabbitmq 5672
-```
-
-The last command should print `127.0.0.1:5673`.
-
-**`ACCESS_REFUSED` / login refused:** the application reached a broker, but that broker rejected its credentials. First verify the mapping above so the application connects to this project's broker. Then verify the development credentials inside the container:
-
-```bash
-sudo docker compose exec rabbitmq rabbitmqctl authenticate_user orderdev orderdev_password
-```
-
-If authentication succeeds, check that both applications use host `localhost` and port `5673`. Environment variables such as `RabbitMq__Port`, `RabbitMq__UserName`, and `RabbitMq__Password` override `appsettings.json`.
-
-If authentication fails inside the container, inspect its users and logs:
-
-```bash
-sudo docker compose exec rabbitmq rabbitmqctl list_users
-sudo docker compose logs --tail 50 rabbitmq
-```
-
-RabbitMQ seeds the default user only when its database is first created. Changing `RABBITMQ_DEFAULT_USER` or `RABBITMQ_DEFAULT_PASS` does not update credentials already stored in the `rabbitmq_data` volume. See [RabbitMQ's access control documentation](https://www.rabbitmq.com/docs/access-control).
-
-**Docker contexts:** these commands use `sudo`, which may select a different Docker daemon from your regular account. If `docker compose ps` and `sudo docker compose ps` show different containers, use the same context consistently. For the system Docker daemon, you can use `docker --context default compose ...` if your account has access.
-
-**The API returns 503 or the consumer cannot connect:** check RabbitMQ:
+Check the broker's status and recent logs:
 
 ```bash
 sudo docker compose ps
 sudo docker compose logs --tail 50 rabbitmq
 ```
 
-Check that `OrderProducer.Api/appsettings.json` and `OrderConsumer.Worker/appsettings.json` both use host `localhost`, port `5673`, username `orderdev`, and password `orderdev_password`.
+Check the `RabbitMq` section in both [API settings](OrderProducer.Api/appsettings.json) and [consumer settings](OrderConsumer.Worker/appsettings.json):
+
+| Setting | Expected value |
+| --- | --- |
+| `HostName` | `localhost` |
+| `Port` | `5673` |
+| `UserName` | `orderdev` |
+| `Password` | `orderdev_password` |
+| `VirtualHost` | `/` |
+
+Restart the apps after changing their settings. Environment variables such as `RabbitMq__Port`, `RabbitMq__UserName`, and `RabbitMq__Password` override these files.
+
+### Login refused / ACCESS_REFUSED
+
+The app reached a RabbitMQ broker, but that broker rejected its credentials. Make sure it is connecting to this project's broker:
+
+```bash
+sudo docker compose port rabbitmq 5672
+```
+
+Expected output: `127.0.0.1:5673`. Here, `5672` is the port **inside the container**; the apps connect to host port `5673`.
+
+If you recently changed the port mappings, recreate the container:
+
+```bash
+sudo docker compose up -d --force-recreate --wait
+```
+
+Then verify the development credentials inside the container:
+
+```bash
+sudo docker compose exec rabbitmq rabbitmqctl authenticate_user orderdev orderdev_password
+```
+
+If this prints **Success**, recheck the app settings above. If it fails, inspect the existing users and broker logs:
+
+```bash
+sudo docker compose exec rabbitmq rabbitmqctl list_users
+sudo docker compose logs --tail 50 rabbitmq
+```
+
+RabbitMQ creates the default user when it first creates its database. Changing the default credentials in Compose does not update users already stored in the data volume. See [RabbitMQ's access control documentation](https://www.rabbitmq.com/docs/access-control) for user management.
+
+### Docker permission or context problems
+
+For a permission error, use the `sudo docker compose ...` commands shown in this guide.
+
+If commands with and without `sudo` show different containers, they may be using different Docker daemons. Check the contexts:
+
+```bash
+docker context show
+sudo docker context show
+```
+
+Use the same context for all Docker commands. If your account has access to the system daemon, you can explicitly select it with `docker --context default compose ...`.
+
+### A port is already in use
+
+Check which process is listening on the affected port:
+
+```bash
+sudo ss -ltnp '( sport = :5000 or sport = :5673 or sport = :15673 )'
+```
+
+If you already have this project's API running, use that instance or stop it with **Ctrl+C** before starting another.
+
+If you change RabbitMQ's host port in [docker-compose.yml](docker-compose.yml), update `RabbitMq:Port` in both app settings files to match, recreate the container, and restart the apps.
