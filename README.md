@@ -1,8 +1,6 @@
-# How to Run Order Messaging System
+# Order Messaging System
 
-This demo lets you send an order and watch it get processed.
-
-## How the project works
+## Project works
 
 The API receives an order and sends an `OrderCreated` event to RabbitMQ. A separate worker reads that event and processes the order. The API and worker run independently, so RabbitMQ can hold messages while the worker is offline.
 
@@ -25,7 +23,7 @@ flowchart TD
     DLX --> DLQ["orders.dead-letter: inspect failed messages"]
 ```
 
-### Order flow, step by step
+### Order flow
 
 1. **Send a request.** The client calls `POST /orders` with `customerName` and `totalAmount`.
 2. **Validate the request.** The API requires a customer name of 1–100 characters after trimming and an amount greater than zero. Invalid requests return `400 Bad Request` without publishing an event.
@@ -35,41 +33,15 @@ flowchart TD
 6. **Consume and process.** `Worker` uses manual acknowledgments and a prefetch count of one. `OrderMessageHandler` deserializes and validates the event, then calls `IOrderProcessor.ProcessAsync`. The current `OrderProcessor` logs the order and simulates work with a one-second delay.
 7. **Acknowledge completion.** After processing completes, the handler sends an ACK. RabbitMQ removes the message, and the worker logs **Processed and acknowledged order**.
 
-### What happens when something fails?
+## Requirement
 
-| Situation | Behavior |
-| --- | --- |
-| Publishing fails or times out | The API returns `503 Service Unavailable`. A timeout can leave the publish outcome unknown, so a client retry can create another order. |
-| The worker is offline | Messages wait in `orders` until a consumer is available. |
-| Invalid JSON, invalid event values, or a processing exception | The handler rejects the message without requeueing. RabbitMQ routes it through `orders.dlx` to `orders.dead-letter`. There is no automatic processing retry. |
-| Connection loss, channel closure, consumer cancellation, or acknowledgment failure | The worker reconnects, waiting five seconds between attempts. Unacknowledged messages may be redelivered. |
-| The worker shuts down during processing | It cancels unfinished work and closes the channel, leaving unacknowledged deliveries available for redelivery. |
-
-Delivery can happen more than once, including when processing succeeds but the acknowledgment fails. When adding real business operations, make them safe to repeat for the same `OrderId`. The demo currently has no database or duplicate-processing protection.
-
-Queue names above use the default `RabbitMq.QueueName` value, `orders`. Changing it also changes the dead-letter exchange to `<QueueName>.dlx` and the dead-letter queue to `<QueueName>.dead-letter`.
-
-### Where the code lives
-
-| Component | Responsibility |
-| --- | --- |
-| `OrderProducer.Api/Program.cs` | Receive HTTP requests, validate input, and return the publish result. |
-| `OrderProducer.Api/Services/RabbitMqPublisher.cs` | Publish persistent JSON messages and wait for broker confirmation. |
-| `Shared.Contracts/Events/OrderCreated.cs` | Define the event shared by producer and consumer. |
-| `Shared.Contracts/Messaging/` | Share RabbitMQ configuration and queue/exchange declarations. |
-| `OrderConsumer.Worker/Worker.cs` | Manage the consumer connection, deliveries, reconnection, and shutdown. |
-| `OrderConsumer.Worker/OrderMessageHandler.cs` | Validate events and acknowledge or reject deliveries. |
-| `OrderConsumer.Worker/OrderProcessor.cs` | Perform the order-processing operation; currently a simulated delay. |
-
-## Run the project
-
-Before starting, install **.NET 10 SDK**, **Docker with Docker Compose**, and **curl**. Make sure Docker is running.
+ install **.NET 10 SDK**, **Docker with Docker Compose**, and **curl**. Make sure Docker is running.
 
 Open a terminal in the `OrderMessagingSystem` folder. Use this folder in each new terminal below.
 
-## 1. Build the project
+## 1.Run Build 
 
-Run each command and wait for it to finish:
+Run this command 
 
 ```bash
 dotnet restore OrderMessagingSystem.slnx
@@ -151,10 +123,6 @@ To run the project again, start RabbitMQ with the command below, then repeat ste
 ```bash
 sudo docker compose up -d --wait
 ```
-
-## Need help?
-
-If a step fails, copy the error shown in that terminal and include it when asking for help. Mention which step you were following.
 
 ## Run the tests
 
