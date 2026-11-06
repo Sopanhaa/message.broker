@@ -20,5 +20,6 @@
 
   <ItemGroup>
     <ProjectReference Include="../OrderProducer.Api/OrderProducer.Api.csproj" />
+    <ProjectReference Include="../OrderConsumer.Worker/OrderConsumer.Worker.csproj" />
   </ItemGroup>
 </Project>

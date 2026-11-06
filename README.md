@@ -94,3 +94,17 @@ sudo docker compose up -d --wait
 ## Need help?
 
 If a step fails, copy the error shown in that terminal and include it when asking for help. Mention which step you were following.
+
+## Consumer behavior
+
+The worker processes one delivery at a time and acknowledges it only after `IOrderProcessor.ProcessAsync` completes. `OrderProcessor` currently simulates work with a one-second delay; replace that operation with your order fulfillment logic. Business operations should tolerate repeated deliveries of the same `OrderId`.
+
+Malformed messages, invalid order values, and processing failures are rejected without requeueing and routed to `orders.dead-letter` (or `<QueueName>.dead-letter` when configured). Inspect that queue in the RabbitMQ dashboard when an order fails.
+
+The worker reconnects after connection loss, channel closure, consumer cancellation, or acknowledgment failure, waiting five seconds between attempts. On shutdown it cancels unfinished work and leaves it unacknowledged for redelivery.
+
+Run the API and consumer tests from `OrderMessagingSystem`:
+
+```bash
+dotnet test OrderMessagingSystem.slnx
+```

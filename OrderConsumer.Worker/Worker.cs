@@ -1,90 +1,104 @@
-using System.Text.Json;
 using RabbitMQ.Client;
 using RabbitMQ.Client.Events;
-using Shared.Contracts.Events;
 using Shared.Contracts.Messaging;
 
 namespace OrderConsumer.Worker;
 
-public sealed class Worker(RabbitMqSettings settings, ILogger<Worker> logger) : BackgroundService
+public sealed class Worker(
+    RabbitMqSettings settings, OrderMessageHandler messageHandler, ILogger<Worker> logger) : BackgroundService
 {
+    private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(5);
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        while (!stoppingToken.IsCancellationRequested)
+        try
         {
-            try
+            while (!stoppingToken.IsCancellationRequested)
             {
-                await ConsumeUntilDisconnectedAsync(stoppingToken);
+                try
+                {
+                    await ConsumeUntilDisconnectedAsync(stoppingToken);
+                }
+                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    logger.LogError(ex, "Consumer connection failed");
+                }
+
+                if (stoppingToken.IsCancellationRequested) break;
+                logger.LogInformation("Reconnecting to RabbitMQ in {DelaySeconds} seconds", ReconnectDelay.TotalSeconds);
+                await Task.Delay(ReconnectDelay, stoppingToken);
             }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
-            catch (Exception ex)
-            {
-                logger.LogError(ex, "Consumer connection failed; reconnecting in 5 seconds");
-            }
-            try { await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken); }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { break; }
         }
-        logger.LogInformation("Consumer stopped. Unacknowledged messages remain available for redelivery.");
+        catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
+        finally
+        {
+            logger.LogInformation("Consumer stopped. Unacknowledged messages remain available for redelivery.");
+        }
     }
 
     private async Task ConsumeUntilDisconnectedAsync(CancellationToken stoppingToken)
     {
+        using var session = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
         await using var connection = await settings.CreateConnectionFactory().CreateConnectionAsync(stoppingToken);
         await using var channel = await connection.CreateChannelAsync(cancellationToken: stoppingToken);
         var disconnected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        channel.ChannelShutdownAsync += (_, reason) =>
+
+        Task OnShutdownAsync(object sender, ShutdownEventArgs reason)
         {
-            logger.LogWarning("Consumer channel closed: {Reason}", reason.ReplyText);
+            if (!stoppingToken.IsCancellationRequested)
+                logger.LogWarning("Consumer connection or channel closed: {Reason}", reason.ReplyText);
             disconnected.TrySetResult();
             return Task.CompletedTask;
-        };
-        await RabbitMqTopology.DeclareAsync(channel, settings, stoppingToken);
-        await channel.BasicQosAsync(prefetchSize: 0, prefetchCount: 1, global: false,
-            cancellationToken: stoppingToken);
+        }
 
-        var consumer = new AsyncEventingBasicConsumer(channel);
-        consumer.ReceivedAsync += async (_, message) =>
+        connection.ConnectionShutdownAsync += OnShutdownAsync;
+        channel.ChannelShutdownAsync += OnShutdownAsync;
+
+        try
         {
-            try
-            {
-                // Deserialize inside the callback: RabbitMQ owns the body memory after it returns.
-                var order = JsonSerializer.Deserialize<OrderCreated>(message.Body.Span, JsonSerializerOptions.Web)
-                    ?? throw new JsonException("OrderCreated payload was null.");
-                if (order.OrderId == Guid.Empty || string.IsNullOrWhiteSpace(order.CustomerName) ||
-                    order.CustomerName.Trim().Length > 100 || order.TotalAmount <= 0 || order.CreatedAtUtc == default)
-                    throw new JsonException("OrderCreated payload contains invalid or missing values.");
+            await RabbitMqTopology.DeclareAsync(channel, settings, stoppingToken);
+            await channel.BasicQosAsync(prefetchSize: 0, prefetchCount: 1, global: false,
+                cancellationToken: stoppingToken);
 
-                logger.LogInformation("Processing order {OrderId}: customer={CustomerName}, total={TotalAmount}",
-                    order.OrderId, order.CustomerName, order.TotalAmount);
-                await Task.Delay(TimeSpan.FromSeconds(1), stoppingToken);
-                await channel.BasicAckAsync(message.DeliveryTag, multiple: false, cancellationToken: stoppingToken);
-                logger.LogInformation("Processed and acknowledged order {OrderId}", order.OrderId);
-            }
-            catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
+            var consumer = new AsyncEventingBasicConsumer(channel);
+            consumer.UnregisteredAsync += (_, _) =>
             {
-                // Closing the channel requeues the delivery; don't acknowledge unfinished work.
-            }
-            catch (Exception ex)
+                if (!stoppingToken.IsCancellationRequested)
+                    logger.LogWarning("Consumer was cancelled; reconnecting to queue {Queue}", settings.QueueName);
+                disconnected.TrySetResult();
+                return Task.CompletedTask;
+            };
+            consumer.ReceivedAsync += async (_, message) =>
             {
-                logger.LogError(ex, "Delivery {DeliveryTag} failed; rejecting to {DeadLetterQueue}",
-                    message.DeliveryTag, settings.DeadLetterQueue);
                 try
                 {
-                    await channel.BasicNackAsync(message.DeliveryTag, multiple: false, requeue: false,
-                        cancellationToken: stoppingToken);
+                    await messageHandler.HandleAsync(channel, message.Body, message.DeliveryTag, session.Token);
                 }
-                catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested) { }
-                catch (Exception nackError)
+                catch (OperationCanceledException) when (session.IsCancellationRequested) { }
+                catch (Exception ex)
                 {
-                    logger.LogWarning(nackError, "Reject failed; reconnecting. The unacknowledged message may be redelivered.");
+                    logger.LogWarning(ex,
+                        "Could not settle delivery {DeliveryTag}; reconnecting. The message may be redelivered.",
+                        message.DeliveryTag);
                     disconnected.TrySetResult();
                 }
-            }
-        };
-        await channel.BasicConsumeAsync(settings.QueueName, autoAck: false, consumer: consumer,
-            cancellationToken: stoppingToken);
-        logger.LogInformation("Waiting for orders in {Queue}; prefetch=1, manual acknowledgments enabled", settings.QueueName);
-        // Disposing the channel/connection on cancellation cancels consumption and requeues unfinished work.
-        await disconnected.Task.WaitAsync(stoppingToken);
+            };
+
+            await channel.BasicConsumeAsync(settings.QueueName, autoAck: false, consumer: consumer,
+                cancellationToken: stoppingToken);
+            logger.LogInformation("Waiting for orders in {Queue}; prefetch=1, manual acknowledgments enabled", settings.QueueName);
+            await disconnected.Task.WaitAsync(stoppingToken);
+        }
+        finally
+        {
+            // Stop in-flight work before disposing the channel and requeuing unfinished deliveries.
+            await session.CancelAsync();
+            connection.ConnectionShutdownAsync -= OnShutdownAsync;
+            channel.ChannelShutdownAsync -= OnShutdownAsync;
+        }
     }
 }
