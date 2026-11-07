@@ -61,6 +61,28 @@ public sealed class OrderConsumerTests
         yield return [ValidOrder with { TotalAmount = 0 }];
         yield return [ValidOrder with { TotalAmount = -1 }];
         yield return [ValidOrder with { CreatedAtUtc = default }];
+        yield return [ValidOrder with { Products = [] }];
+        yield return [ValidOrder with { Products = [null!] }];
+        yield return [ValidOrder with { Products = [new(" ", 1, 50m)] }];
+        yield return [ValidOrder with { Products = [new(new string('x', 101), 1, 50m)] }];
+        yield return [ValidOrder with { Products = [new("Mouse", -1, 50m)] }];
+        yield return [ValidOrder with { Products = [new("Mouse", 1, 0m)] }];
+        yield return [ValidOrder with { Products = [new("Mouse", 1, 10m)] }];
+        yield return [ValidOrder with { Products = [new("Mouse", 2, decimal.MaxValue)] }];
+    }
+
+    [Fact]
+    public async Task Product_details_survive_message_serialization_and_reach_the_processor()
+    {
+        var order = ValidOrder with { Products = [new("Keyboard", 2, 20m), new("Mouse", 1, 10m)] };
+        var processor = new FakeProcessor();
+        var (channel, calls) = CreateChannel();
+
+        await CreateHandler(processor).HandleAsync(channel, Serialize(order), 42, CancellationToken.None);
+
+        var processed = Assert.Single(processor.Orders);
+        Assert.Equal(order.Products, processed.Products);
+        Assert.Equal(("ack", 42UL, false, false), Assert.Single(calls.Settlements));
     }
 
     [Theory]

@@ -21,7 +21,8 @@ app.MapPost("/orders", async (CreateOrderRequest request, IMessagePublisher publ
     if (errors.Count > 0) return Results.ValidationProblem(errors);
 
     var order = new OrderCreated(Guid.NewGuid(), request.CustomerName!.Trim(),
-        request.TotalAmount, DateTimeOffset.UtcNow);
+        request.TotalAmount, DateTimeOffset.UtcNow,
+        request.Products?.Select(product => product with { Name = product.Name.Trim() }).ToArray());
     try
     {
         await publisher.PublishAsync(order, cancellationToken);

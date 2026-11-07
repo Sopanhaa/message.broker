@@ -25,8 +25,8 @@ flowchart TD
 
 ### Order flow
 
-1. **Send a request.** The client calls `POST /orders` with `customerName` and `totalAmount`.
-2. **Validate the request.** The API requires a customer name of 1–100 characters after trimming and an amount greater than zero. Invalid requests return `400 Bad Request` without publishing an event.
+1. **Send a request.** The client calls `POST /orders` with `customerName`, `totalAmount`, and an optional `products` array. Each product contains `name`, `quantity`, and `unitPrice`.
+2. **Validate the request.** The API requires a customer name of 1–100 characters after trimming and an amount greater than zero. If products are supplied, the array must be nonempty, names must contain 1–100 characters after trimming, quantities must be positive integers, and unit prices must be positive. The sum of `quantity * unitPrice` must equal `totalAmount`. Invalid requests return `400 Bad Request` without publishing an event.
 3. **Create the event.** The API generates an `OrderId` and `CreatedAtUtc`, trims the customer name, and builds an `OrderCreated` event using the shared contract.
 4. **Publish to RabbitMQ.** `RabbitMqPublisher` serializes the event as JSON and publishes a persistent message through the default exchange, using `orders` as the routing key. Both applications declare the same durable queues and dead-letter exchange.
 5. **Return acceptance.** The API waits for RabbitMQ to confirm the publish before returning `202 Accepted` with the order ID and creation time. This confirms broker acceptance; processing may still be pending.
@@ -89,14 +89,14 @@ Open a **third terminal** and paste this whole command:
 ```bash
 curl -i -X POST http://localhost:5000/orders \
   -H 'Content-Type: application/json' \
-  -d '{"customerName":"Sopanha","totalAmount":50.00}'
+  -d '{"customerName":"Sopanha","totalAmount":50.00,"products":[{"name":"Keyboard","quantity":2,"unitPrice":20.00},{"name":"Mouse","quantity":1,"unitPrice":10.00}]}'
 ```
 
 You should receive **202 Accepted**. This means RabbitMQ confirmed the published order; processing may still be pending.
 
 Check the **first terminal** for **Processed and acknowledged order**. Your project is working!
 
-You can send another order by running the command again. Change `Sopanha` and `50.00` to try a different name and amount.
+You can send another order by running the command again. Change the customer and products, keeping `totalAmount` equal to the sum of the product amounts. Product names are trimmed before publishing, and product details are included in the `OrderCreated` message and logged by the worker. Orders without `products` remain supported, including older queued messages.
 
 ## 6. View the dashboard — optional
 

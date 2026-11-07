@@ -19,7 +19,8 @@ public sealed class OrderMessageHandler(
             order = JsonSerializer.Deserialize<OrderCreated>(body.Span, JsonSerializerOptions.Web)
                 ?? throw new JsonException("OrderCreated payload was null.");
             if (order.OrderId == Guid.Empty || string.IsNullOrWhiteSpace(order.CustomerName) ||
-                order.CustomerName.Trim().Length > 100 || order.TotalAmount <= 0 || order.CreatedAtUtc == default)
+                order.CustomerName.Trim().Length > 100 || order.TotalAmount <= 0 || order.CreatedAtUtc == default ||
+                !OrderProduct.IsValid(order.Products, order.TotalAmount))
                 throw new JsonException("OrderCreated payload contains invalid or missing values.");
 
             await processor.ProcessAsync(order, cancellationToken);

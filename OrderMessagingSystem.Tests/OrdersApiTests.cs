@@ -41,6 +41,43 @@ public sealed class OrdersApiTests
     }
 
     [Fact]
+    public async Task Order_products_are_trimmed_and_included_in_the_published_event()
+    {
+        await using var app = new ApiFactory();
+        using var client = app.CreateClient();
+        using var response = await client.PostAsJsonAsync("/orders", new
+        {
+            customerName = "Sopanha",
+            totalAmount = 50m,
+            products = new[] { new OrderProduct(" Keyboard ", 2, 20m), new OrderProduct("Mouse", 1, 10m) }
+        });
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        var order = Assert.Single(app.Publisher.Orders);
+        Assert.Equal(new[] { new OrderProduct("Keyboard", 2, 20m), new OrderProduct("Mouse", 1, 10m) }, order.Products);
+    }
+
+    [Theory]
+    [InlineData("[]")]
+    [InlineData("[null]")]
+    [InlineData("[{}]")]
+    [InlineData("[{\"name\":\" \",\"quantity\":1,\"unitPrice\":50}]")]
+    [InlineData("[{\"name\":\"Mouse\",\"quantity\":0,\"unitPrice\":50}]")]
+    [InlineData("[{\"name\":\"Mouse\",\"quantity\":1,\"unitPrice\":-50}]")]
+    [InlineData("[{\"name\":\"Mouse\",\"quantity\":1,\"unitPrice\":10}]")]
+    [InlineData("[{\"name\":\"Mouse\",\"quantity\":2,\"unitPrice\":79228162514264337593543950335}]")]
+    public async Task Invalid_products_return_bad_request_without_publishing(string products)
+    {
+        await using var app = new ApiFactory();
+        using var client = app.CreateClient();
+        var json = "{\"customerName\":\"Sopanha\",\"totalAmount\":50,\"products\":" + products + "}";
+        using var response = await client.PostAsync("/orders", new StringContent(json, Encoding.UTF8, "application/json"));
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Empty(app.Publisher.Orders);
+    }
+
+    [Fact]
     public async Task Accepted_response_waits_until_publishing_is_confirmed()
     {
         await using var app = new ApiFactory();
