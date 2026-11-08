@@ -180,10 +180,134 @@ public sealed class OrderConsumerTests
         Assert.Equal((processingFails ? "nack" : "ack", 42UL, false, false), Assert.Single(calls.Settlements));
     }
 
-    private static byte[] Serialize(OrderCreated order) => JsonSerializer.SerializeToUtf8Bytes(order, JsonSerializerOptions.Web);
+    [Fact]
+    public async Task Valid_status_update_is_acknowledged_and_stored()
+    {
+        var store = new OrderStatusStore();
+        var processor = new OrderStatusProcessor(store, NullLogger<OrderStatusProcessor>.Instance);
+        var (channel, calls) = CreateChannel();
+        var update = new OrderStatusChanged(Guid.NewGuid(), OrderStatus.Completed, DateTimeOffset.UtcNow,
+            " Delivered ");
+
+        await CreateStatusHandler(processor).HandleAsync(channel, Serialize(update), 7, CancellationToken.None);
+
+        Assert.Equal(("ack", 7UL, false, false), Assert.Single(calls.Settlements));
+        var state = Assert.IsType<OrderState>(store.Get(update.OrderId));
+        Assert.Equal(OrderStatus.Completed, state.Status);
+        Assert.Equal("Delivered", state.Detail);
+    }
+
+    [Fact]
+    public async Task Stale_and_duplicate_status_updates_are_ignored()
+    {
+        var store = new OrderStatusStore();
+        var orderId = Guid.NewGuid();
+        var now = DateTimeOffset.UtcNow;
+        var completed = new OrderStatusChanged(orderId, OrderStatus.Completed, now);
+
+        Assert.NotNull(store.Apply(completed));
+        Assert.Null(store.Apply(completed));
+        Assert.Null(store.Apply(new OrderStatusChanged(orderId, OrderStatus.Processing, now.AddSeconds(-1))));
+
+        var state = Assert.IsType<OrderState>(store.Get(orderId));
+        Assert.Equal(OrderStatus.Completed, state.Status);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("{broken")]
+    [InlineData("null")]
+    [InlineData("{}")]
+    public async Task Invalid_status_json_is_dead_lettered_without_processing(string json)
+    {
+        var processor = new FakeStatusProcessor();
+        var (channel, calls) = CreateChannel();
+
+        await CreateStatusHandler(processor).HandleAsync(channel, Encoding.UTF8.GetBytes(json), 7,
+            CancellationToken.None);
+
+        Assert.Empty(processor.Updates);
+        Assert.Equal(("nack", 7UL, false, false), Assert.Single(calls.Settlements));
+    }
+
+    public static IEnumerable<object[]> InvalidStatusUpdates()
+    {
+        yield return [new OrderStatusChanged(Guid.Empty, OrderStatus.Completed, DateTimeOffset.UtcNow)];
+        yield return [new OrderStatusChanged(Guid.NewGuid(), (OrderStatus)99, DateTimeOffset.UtcNow)];
+        yield return [new OrderStatusChanged(Guid.NewGuid(), OrderStatus.Completed, default)];
+        yield return
+        [
+            new OrderStatusChanged(Guid.NewGuid(), OrderStatus.Completed, DateTimeOffset.UtcNow,
+                new string('x', OrderStatusChanged.MaxDetailLength + 1))
+        ];
+    }
+
+    [Theory]
+    [MemberData(nameof(InvalidStatusUpdates))]
+    public async Task Invalid_status_update_is_dead_lettered_without_processing(OrderStatusChanged update)
+    {
+        var processor = new FakeStatusProcessor();
+        var (channel, calls) = CreateChannel();
+
+        await CreateStatusHandler(processor).HandleAsync(channel, Serialize(update), 7, CancellationToken.None);
+
+        Assert.Empty(processor.Updates);
+        Assert.Equal(("nack", 7UL, false, false), Assert.Single(calls.Settlements));
+    }
+
+    [Fact]
+    public async Task Status_processing_failure_dead_letters_the_message()
+    {
+        var processor = new FakeStatusProcessor(_ => throw new InvalidOperationException("Status failed"));
+        var (channel, calls) = CreateChannel();
+
+        await CreateStatusHandler(processor).HandleAsync(channel,
+            Serialize(new OrderStatusChanged(Guid.NewGuid(), OrderStatus.Completed, DateTimeOffset.UtcNow)),
+            7, CancellationToken.None);
+
+        Assert.Equal(("nack", 7UL, false, false), Assert.Single(calls.Settlements));
+    }
+
+    [Fact]
+    public async Task Cancellation_before_status_processing_leaves_message_unsettled()
+    {
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+        var processor = new FakeStatusProcessor();
+        var (channel, calls) = CreateChannel();
+
+        await CreateStatusHandler(processor).HandleAsync(channel,
+            Serialize(new OrderStatusChanged(Guid.NewGuid(), OrderStatus.Completed, DateTimeOffset.UtcNow)),
+            7, cancellation.Token);
+
+        Assert.Empty(processor.Updates);
+        Assert.Empty(calls.Settlements);
+    }
+
+    [Fact]
+    public async Task Status_settlement_failure_propagates_for_reconnection_without_a_second_settlement()
+    {
+        var store = new OrderStatusStore();
+        var processor = new OrderStatusProcessor(store, NullLogger<OrderStatusProcessor>.Instance);
+        var (channel, calls) = CreateChannel();
+        calls.Failure = new IOException("Channel closed during settlement");
+
+        var error = await Assert.ThrowsAsync<IOException>(() => CreateStatusHandler(processor).HandleAsync(
+            channel, Serialize(new OrderStatusChanged(Guid.NewGuid(), OrderStatus.Completed, DateTimeOffset.UtcNow)),
+            7, CancellationToken.None));
+
+        Assert.Same(calls.Failure, error);
+        Assert.Equal(("ack", 7UL, false, false), Assert.Single(calls.Settlements));
+    }
+
+    private static byte[] Serialize<T>(T message) =>
+        JsonSerializer.SerializeToUtf8Bytes(message, JsonSerializerOptions.Web);
 
     private static OrderMessageHandler CreateHandler(IOrderProcessor processor) =>
         new(processor, new RabbitMqSettings(), NullLogger<OrderMessageHandler>.Instance);
+
+    private static OrderStatusMessageHandler CreateStatusHandler(IOrderStatusProcessor processor) =>
+        new(processor, new RabbitMqSettings(), NullLogger<OrderStatusMessageHandler>.Instance);
 
     private static (IChannel Channel, ChannelProxy Calls) CreateChannel()
     {
@@ -217,6 +341,17 @@ public sealed class OrderConsumerTests
         public async Task ProcessAsync(OrderCreated order, CancellationToken cancellationToken)
         {
             Orders.Add(order);
+            if (process is not null) await process(cancellationToken);
+        }
+    }
+
+    private sealed class FakeStatusProcessor(Func<CancellationToken, Task>? process = null) : IOrderStatusProcessor
+    {
+        public List<OrderStatusChanged> Updates { get; } = [];
+
+        public async Task ProcessAsync(OrderStatusChanged update, CancellationToken cancellationToken)
+        {
+            Updates.Add(update);
             if (process is not null) await process(cancellationToken);
         }
     }

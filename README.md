@@ -6,21 +6,20 @@ The API receives an order and sends an `OrderCreated` event to RabbitMQ. A separ
 
 ```mermaid
 flowchart TD
-    Client["Client: POST /orders"] --> API["OrderProducer.Api: validate request"]
-    API --> Publisher["RabbitMqPublisher: publish OrderCreated JSON"]
-    Publisher --> Exchange["RabbitMQ default exchange"]
-    Exchange --> Queue["orders: durable queue"]
-    Exchange -. "Broker confirmation" .-> Publisher
-    Publisher -. "202 Accepted after confirmation" .-> Client
-    Queue --> Worker["OrderConsumer.Worker: receive one delivery"]
-    Worker --> Handler["OrderMessageHandler: deserialize and validate"]
-    Handler --> Processor["OrderProcessor: process order"]
-    Processor --> Success{"Processing succeeded?"}
-    Success -->|Yes| Ack["ACK: RabbitMQ removes the message"]
-    Handler -->|Invalid message| Reject["NACK with requeue=false"]
-    Success -->|Exception| Reject
-    Reject --> DLX["orders.dlx: dead-letter exchange"]
-    DLX --> DLQ["orders.dead-letter: inspect failed messages"]
+    Client["Client"] -->|"POST /orders"| API["OrderProducer.Api: validate request"]
+    Client -->|"PATCH /orders/{id}/status"| API
+    API --> Publisher["RabbitMqPublisher"]
+    Publisher -->|"OrderCreated"| Queue["orders: durable queue"]
+    Publisher -->|"OrderStatusChanged"| StatusQueue["orders.status: durable queue"]
+    Queue --> Worker["OrderConsumer.Worker"]
+    StatusQueue --> Worker
+    Worker --> OrderPath["OrderMessageHandler -> OrderProcessor"]
+    Worker --> StatusPath["OrderStatusMessageHandler -> OrderStatusProcessor"]
+    OrderPath --> Store["OrderStatusStore: in-memory order state"]
+    StatusPath --> Store
+    Worker -->|"Success"| Ack["ACK: RabbitMQ removes the message"]
+    Worker -->|"Invalid or failed"| Reject["NACK with requeue=false"]
+    Reject --> DLQ["dead-letter queues: inspect failed messages"]
 ```
 
 ### Order flow
@@ -28,10 +27,12 @@ flowchart TD
 1. **Send a request.** The client calls `POST /orders` with `customerName`, `totalAmount`, and an optional `products` array. Each product contains `name`, `quantity`, and `unitPrice`.
 2. **Validate the request.** The API requires a customer name of 1–100 characters after trimming and an amount greater than zero. If products are supplied, the array must be nonempty, names must contain 1–100 characters after trimming, quantities must be positive integers, and unit prices must be positive. The sum of `quantity * unitPrice` must equal `totalAmount`. Invalid requests return `400 Bad Request` without publishing an event.
 3. **Create the event.** The API generates an `OrderId` and `CreatedAtUtc`, trims the customer name, and builds an `OrderCreated` event using the shared contract.
-4. **Publish to RabbitMQ.** `RabbitMqPublisher` serializes the event as JSON and publishes a persistent message through the default exchange, using `orders` as the routing key. Both applications declare the same durable queues and dead-letter exchange.
+4. **Publish to RabbitMQ.** `RabbitMqPublisher` serializes the event as JSON and publishes a persistent message through the default exchange, using `orders` as the routing key. Both applications declare the same durable queues and dead-letter exchanges.
 5. **Return acceptance.** The API waits for RabbitMQ to confirm the publish before returning `202 Accepted` with the order ID and creation time. This confirms broker acceptance; processing may still be pending.
-6. **Consume and process.** `Worker` uses manual acknowledgments and a prefetch count of one. `OrderMessageHandler` deserializes and validates the event, then calls `IOrderProcessor.ProcessAsync`. The current `OrderProcessor` logs the order and simulates work with a one-second delay.
+6. **Consume and process.** `Worker` uses manual acknowledgments and a prefetch count of one per queue. `OrderMessageHandler` deserializes and validates the event, then calls `IOrderProcessor.ProcessAsync`. `OrderProcessor` records `Processing`, logs the order, simulates work with a one-second delay, and records `Completed`.
 7. **Acknowledge completion.** After processing completes, the handler sends an ACK. RabbitMQ removes the message, and the worker logs **Processed and acknowledged order**.
+8. **Update the status.** The client calls `PATCH /orders/{orderId}/status` with a `status` (`Received`, `Processing`, `Completed`, or `Failed`) and an optional `detail` of up to 500 characters. The API validates the request, publishes `OrderStatusChanged` to the `orders.status` queue, and returns `202 Accepted` after broker confirmation. Invalid requests return `400 Bad Request` without publishing.
+9. **Consume status updates.** The same `Worker` consumes `orders.status` with its own prefetch and manual acknowledgments. `OrderStatusMessageHandler` validates each update, then `OrderStatusProcessor` applies it to the in-memory `OrderStatusStore`. Older or duplicate updates are ignored, so redelivery and out-of-order messages are safe. Failed or invalid status messages are rejected to `orders.status.dead-letter`.
 
 ## Requirement
 
@@ -68,7 +69,7 @@ In the same terminal, run:
 dotnet run --project OrderConsumer.Worker
 ```
 
-Wait for **Waiting for orders**. Leave this terminal running.
+Wait for **Waiting for orders in orders and status updates in orders.status**. Leave this terminal running.
 
 ## 4. Start the API — terminal 2
 
@@ -98,6 +99,18 @@ Check the **first terminal** for **Processed and acknowledged order**. Your proj
 
 You can send another order by running the command again. Change the customer and products, keeping `totalAmount` equal to the sum of the product amounts. Product names are trimmed before publishing, and product details are included in the `OrderCreated` message and logged by the worker. Orders without `products` remain supported, including older queued messages.
 
+### Update an order status
+
+Copy the `orderId` from the `202 Accepted` response and send a status update. The worker logs the new state and ignores older or duplicate updates:
+
+```bash
+curl -i -X PATCH http://localhost:5000/orders/PASTE_ORDER_ID_HERE/status \
+  -H 'Content-Type: application/json' \
+  -d '{"status":"Completed","detail":"Delivered to customer"}'
+```
+
+Accepted status values are `Received`, `Processing`, `Completed`, and `Failed`. `detail` is optional, trimmed, and limited to 500 characters. You should receive **202 Accepted**; check the worker terminal for **status updated to Completed**.
+
 ## 6. View the dashboard — optional
 
 Open **http://localhost:15673** in your browser and sign in:
@@ -106,7 +119,7 @@ Open **http://localhost:15673** in your browser and sign in:
 | --- | --- |
 | `orderdev` | `orderdev_password` |
 
-Select **Queues and Streams**, then **orders**. An empty queue is normal: the processor may have already finished the orders.
+Select **Queues and Streams**. You should see `orders` and `orders.status` for live work, plus `orders.dead-letter` and `orders.status.dead-letter` for rejected messages. An empty queue is normal: the processor may have already finished the messages.
 
 ## 7. Stop when finished
 
@@ -131,3 +144,5 @@ Run the API and consumer tests from `OrderMessagingSystem`:
 ```bash
 dotnet test OrderMessagingSystem.slnx
 ```
+
+The tests cover request validation, broker-confirmation behavior, order processing, acknowledgement and dead-letter paths, status updates, and stale or duplicate status handling. They do not need a running RabbitMQ instance.

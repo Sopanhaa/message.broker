@@ -13,9 +13,17 @@ public sealed class RabbitMqPublisher(RabbitMqSettings settings, ILogger<RabbitM
     private IConnection? _connection;
     private IChannel? _channel;
 
-    public async Task PublishAsync(OrderCreated order, CancellationToken cancellationToken)
+    public Task PublishAsync(OrderCreated order, CancellationToken cancellationToken) =>
+        PublishAsync(order, settings.QueueName, nameof(OrderCreated), order.OrderId, cancellationToken);
+
+    public Task PublishStatusAsync(OrderStatusChanged status, CancellationToken cancellationToken) =>
+        PublishAsync(status, settings.StatusQueueName, nameof(OrderStatusChanged), status.OrderId,
+            cancellationToken);
+
+    private async Task PublishAsync<T>(T message, string routingKey, string messageType, Guid messageId,
+        CancellationToken cancellationToken)
     {
-        var body = JsonSerializer.SerializeToUtf8Bytes(order, JsonSerializerOptions.Web);
+        var body = JsonSerializer.SerializeToUtf8Bytes(message, JsonSerializerOptions.Web);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         timeout.CancelAfter(TimeSpan.FromSeconds(settings.PublishTimeoutSeconds));
         var entered = false;
@@ -38,14 +46,14 @@ public sealed class RabbitMqPublisher(RabbitMqSettings settings, ILogger<RabbitM
             {
                 Persistent = true,
                 ContentType = "application/json",
-                Type = nameof(OrderCreated),
-                MessageId = order.OrderId.ToString()
+                Type = messageType,
+                MessageId = messageId.ToString()
             };
             // With confirmation tracking enabled, this await includes the broker confirmation.
             // mandatory=true also reports an unroutable message as a publishing failure.
-            await _channel!.BasicPublishAsync(exchange: "", routingKey: settings.QueueName,
+            await _channel!.BasicPublishAsync(exchange: "", routingKey: routingKey,
                 mandatory: true, basicProperties: properties, body: body, cancellationToken: timeout.Token);
-            logger.LogInformation("Broker confirmed OrderCreated {OrderId}", order.OrderId);
+            logger.LogInformation("Broker confirmed {MessageType} {MessageId}", messageType, messageId);
         }
         catch (Exception ex)
         {
@@ -53,7 +61,7 @@ public sealed class RabbitMqPublisher(RabbitMqSettings settings, ILogger<RabbitM
                 await ResetAsync(); // The next request makes a fresh connection after a failure.
             if (ex is OperationCanceledException && cancellationToken.IsCancellationRequested)
                 throw;
-            throw new MessagePublishException("RabbitMQ did not confirm the order.", ex);
+            throw new MessagePublishException("RabbitMQ did not confirm the message.", ex);
         }
         finally
         {

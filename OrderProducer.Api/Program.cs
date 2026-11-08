@@ -36,6 +36,30 @@ app.MapPost("/orders", async (CreateOrderRequest request, IMessagePublisher publ
             detail: "Check RabbitMQ and try again. A timeout can mean the outcome is unknown; retrying can create duplicates.");
     }
 });
+app.MapPatch("/orders/{orderId:guid}/status",
+    async (Guid orderId, UpdateOrderStatusRequest request, IMessagePublisher publisher,
+        ILogger<Program> logger, CancellationToken cancellationToken) =>
+    {
+        var errors = request.Validate();
+        if (orderId == Guid.Empty)
+            errors[nameof(orderId)] = ["Order ID must not be empty."];
+        if (errors.Count > 0) return Results.ValidationProblem(errors);
+
+        var detail = string.IsNullOrWhiteSpace(request.Detail) ? null : request.Detail.Trim();
+        var status = new OrderStatusChanged(orderId, request.Status!.Value, DateTimeOffset.UtcNow, detail);
+        try
+        {
+            await publisher.PublishStatusAsync(status, cancellationToken);
+            return Results.Accepted(value: new { status.OrderId, status.Status, status.UpdatedAtUtc });
+        }
+        catch (MessagePublishException ex)
+        {
+            logger.LogError(ex, "Publishing status update for order {OrderId} failed", orderId);
+            return Results.Problem(statusCode: StatusCodes.Status503ServiceUnavailable,
+                title: "Order status could not be confirmed by RabbitMQ",
+                detail: "Check RabbitMQ and try again. A timeout can mean the outcome is unknown; retrying can create duplicates.");
+        }
+    });
 app.Run();
 
 // Allows WebApplicationFactory to start this API in automated tests.

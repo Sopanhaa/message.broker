@@ -15,6 +15,11 @@ public sealed class RabbitMqSettings
     public string DeadLetterExchange => $"{QueueName}.dlx";
     public string DeadLetterQueue => $"{QueueName}.dead-letter";
 
+    // Status updates travel on their own queue so a slow order process cannot delay them.
+    public string StatusQueueName => $"{QueueName}.status";
+    public string StatusDeadLetterExchange => $"{StatusQueueName}.dlx";
+    public string StatusDeadLetterQueue => $"{StatusQueueName}.dead-letter";
+
     public void Validate()
     {
         if (string.IsNullOrWhiteSpace(HostName) || string.IsNullOrWhiteSpace(UserName) ||

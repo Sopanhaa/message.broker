@@ -5,6 +5,8 @@ namespace OrderProducer.Api.Services;
 public interface IMessagePublisher
 {
     Task PublishAsync(OrderCreated order, CancellationToken cancellationToken);
+
+    Task PublishStatusAsync(OrderStatusChanged status, CancellationToken cancellationToken);
 }
 
 public sealed class MessagePublishException(string message, Exception innerException)

@@ -5,7 +5,8 @@ using Shared.Contracts.Messaging;
 namespace OrderConsumer.Worker;
 
 public sealed class Worker(
-    RabbitMqSettings settings, OrderMessageHandler messageHandler, ILogger<Worker> logger) : BackgroundService
+    RabbitMqSettings settings, OrderMessageHandler orderHandler, OrderStatusMessageHandler statusHandler,
+    ILogger<Worker> logger) : BackgroundService
 {
     private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(5);
 
@@ -64,33 +65,45 @@ public sealed class Worker(
             await channel.BasicQosAsync(prefetchSize: 0, prefetchCount: 1, global: false,
                 cancellationToken: stoppingToken);
 
-            var consumer = new AsyncEventingBasicConsumer(channel);
-            consumer.UnregisteredAsync += (_, _) =>
+            AsyncEventingBasicConsumer CreateConsumer(string queueName,
+                Func<IChannel, ReadOnlyMemory<byte>, ulong, CancellationToken, Task> handle)
             {
-                if (!stoppingToken.IsCancellationRequested)
-                    logger.LogWarning("Consumer was cancelled; reconnecting to queue {Queue}", settings.QueueName);
-                disconnected.TrySetResult();
-                return Task.CompletedTask;
-            };
-            consumer.ReceivedAsync += async (_, message) =>
-            {
-                try
+                var consumer = new AsyncEventingBasicConsumer(channel);
+                consumer.UnregisteredAsync += (_, _) =>
                 {
-                    await messageHandler.HandleAsync(channel, message.Body, message.DeliveryTag, session.Token);
-                }
-                catch (OperationCanceledException) when (session.IsCancellationRequested) { }
-                catch (Exception ex)
-                {
-                    logger.LogWarning(ex,
-                        "Could not settle delivery {DeliveryTag}; reconnecting. The message may be redelivered.",
-                        message.DeliveryTag);
+                    if (!stoppingToken.IsCancellationRequested)
+                        logger.LogWarning("Consumer was cancelled; reconnecting to queue {Queue}", queueName);
                     disconnected.TrySetResult();
-                }
-            };
+                    return Task.CompletedTask;
+                };
+                consumer.ReceivedAsync += async (_, message) =>
+                {
+                    try
+                    {
+                        await handle(channel, message.Body, message.DeliveryTag, session.Token);
+                    }
+                    catch (OperationCanceledException) when (session.IsCancellationRequested) { }
+                    catch (Exception ex)
+                    {
+                        logger.LogWarning(ex,
+                            "Could not settle delivery {DeliveryTag} from {Queue}; reconnecting. The message may be redelivered.",
+                            message.DeliveryTag, queueName);
+                        disconnected.TrySetResult();
+                    }
+                };
+                return consumer;
+            }
 
-            await channel.BasicConsumeAsync(settings.QueueName, autoAck: false, consumer: consumer,
+            var orderConsumer = CreateConsumer(settings.QueueName, orderHandler.HandleAsync);
+            var statusConsumer = CreateConsumer(settings.StatusQueueName, statusHandler.HandleAsync);
+
+            await channel.BasicConsumeAsync(settings.QueueName, autoAck: false, consumer: orderConsumer,
                 cancellationToken: stoppingToken);
-            logger.LogInformation("Waiting for orders in {Queue}; prefetch=1, manual acknowledgments enabled", settings.QueueName);
+            await channel.BasicConsumeAsync(settings.StatusQueueName, autoAck: false, consumer: statusConsumer,
+                cancellationToken: stoppingToken);
+            logger.LogInformation(
+                "Waiting for orders in {Queue} and status updates in {StatusQueue}; prefetch=1 per queue, manual acknowledgments enabled",
+                settings.QueueName, settings.StatusQueueName);
             await disconnected.Task.WaitAsync(stoppingToken);
         }
         finally

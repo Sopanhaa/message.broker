@@ -6,17 +6,25 @@ public static class RabbitMqTopology
 {
     public static async Task DeclareAsync(IChannel channel, RabbitMqSettings settings, CancellationToken token)
     {
-        await channel.ExchangeDeclareAsync(settings.DeadLetterExchange, ExchangeType.Direct,
+        await DeclareQueueAsync(channel, settings.QueueName, settings.DeadLetterExchange,
+            settings.DeadLetterQueue, token);
+        await DeclareQueueAsync(channel, settings.StatusQueueName, settings.StatusDeadLetterExchange,
+            settings.StatusDeadLetterQueue, token);
+    }
+
+    private static async Task DeclareQueueAsync(IChannel channel, string queueName, string deadLetterExchange,
+        string deadLetterQueue, CancellationToken token)
+    {
+        await channel.ExchangeDeclareAsync(deadLetterExchange, ExchangeType.Direct,
             durable: true, autoDelete: false, cancellationToken: token);
-        await channel.QueueDeclareAsync(settings.DeadLetterQueue, durable: true,
+        await channel.QueueDeclareAsync(deadLetterQueue, durable: true,
             exclusive: false, autoDelete: false, cancellationToken: token);
-        await channel.QueueBindAsync(settings.DeadLetterQueue, settings.DeadLetterExchange,
-            settings.QueueName, cancellationToken: token);
-        await channel.QueueDeclareAsync(settings.QueueName, durable: true, exclusive: false,
+        await channel.QueueBindAsync(deadLetterQueue, deadLetterExchange, queueName, cancellationToken: token);
+        await channel.QueueDeclareAsync(queueName, durable: true, exclusive: false,
             autoDelete: false, arguments: new Dictionary<string, object?>
             {
-                ["x-dead-letter-exchange"] = settings.DeadLetterExchange,
-                ["x-dead-letter-routing-key"] = settings.QueueName
+                ["x-dead-letter-exchange"] = deadLetterExchange,
+                ["x-dead-letter-routing-key"] = queueName
             }, cancellationToken: token);
     }
 }

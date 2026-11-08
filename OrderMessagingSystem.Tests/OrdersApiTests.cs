@@ -146,6 +146,76 @@ public sealed class OrdersApiTests
         Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
     }
 
+    [Fact]
+    public async Task Valid_status_update_publishes_event_and_returns_accepted()
+    {
+        await using var app = new ApiFactory();
+        using var client = app.CreateClient();
+        var orderId = Guid.NewGuid();
+        using var response = await client.PatchAsJsonAsync($"/orders/{orderId}/status",
+            new { status = "Completed", detail = " Delivered " });
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        var status = Assert.Single(app.Publisher.Statuses);
+        Assert.Equal(orderId, status.OrderId);
+        Assert.Equal(OrderStatus.Completed, status.Status);
+        Assert.Equal("Delivered", status.Detail);
+        Assert.InRange(status.UpdatedAtUtc, DateTimeOffset.UtcNow.AddMinutes(-1), DateTimeOffset.UtcNow);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("Completed", body.GetProperty("status").GetString());
+    }
+
+    [Theory]
+    [InlineData("{}")]
+    [InlineData("{\"status\":999}")]
+    [InlineData("{\"status\":\"Unknown\"}")]
+    public async Task Invalid_status_update_returns_bad_request_without_publishing(string json)
+    {
+        await using var app = new ApiFactory();
+        using var client = app.CreateClient();
+        using var response = await client.PatchAsync($"/orders/{Guid.NewGuid()}/status",
+            new StringContent(json, Encoding.UTF8, "application/json"));
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Empty(app.Publisher.Statuses);
+    }
+
+    [Fact]
+    public async Task Empty_order_id_returns_bad_request_without_publishing()
+    {
+        await using var app = new ApiFactory();
+        using var client = app.CreateClient();
+        using var response = await client.PatchAsJsonAsync($"/orders/{Guid.Empty}/status",
+            new { status = "Completed" });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Empty(app.Publisher.Statuses);
+    }
+
+    [Fact]
+    public async Task Long_status_detail_returns_bad_request_without_publishing()
+    {
+        await using var app = new ApiFactory();
+        using var client = app.CreateClient();
+        using var response = await client.PatchAsJsonAsync($"/orders/{Guid.NewGuid()}/status",
+            new { status = "Failed", detail = new string('x', OrderStatusChanged.MaxDetailLength + 1) });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Empty(app.Publisher.Statuses);
+    }
+
+    [Fact]
+    public async Task Status_publish_failure_returns_service_unavailable()
+    {
+        await using var app = new ApiFactory();
+        app.Publisher.OnPublishStatus = _ => throw new MessagePublishException("Not confirmed", new IOException("broker down"));
+        using var client = app.CreateClient();
+        using var response = await client.PatchAsJsonAsync($"/orders/{Guid.NewGuid()}/status",
+            new { status = "Failed" });
+
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+    }
+
     private sealed class ApiFactory : WebApplicationFactory<Program>
     {
         public FakePublisher Publisher { get; } = new();
@@ -159,11 +229,20 @@ public sealed class OrdersApiTests
     private sealed class FakePublisher : IMessagePublisher
     {
         public List<OrderCreated> Orders { get; } = [];
+        public List<OrderStatusChanged> Statuses { get; } = [];
         public Func<CancellationToken, Task>? OnPublish { get; set; }
+        public Func<CancellationToken, Task>? OnPublishStatus { get; set; }
+
         public async Task PublishAsync(OrderCreated order, CancellationToken cancellationToken)
         {
             if (OnPublish is not null) await OnPublish(cancellationToken);
             Orders.Add(order);
+        }
+
+        public async Task PublishStatusAsync(OrderStatusChanged status, CancellationToken cancellationToken)
+        {
+            if (OnPublishStatus is not null) await OnPublishStatus(cancellationToken);
+            Statuses.Add(status);
         }
     }
 }
