@@ -5,3 +5,5 @@
   <Project Path="OrderProducer.Api/OrderProducer.Api.csproj" />
   <Project Path="Shared.Contracts/Shared.Contracts.csproj" />
 </Solution>
+
+
