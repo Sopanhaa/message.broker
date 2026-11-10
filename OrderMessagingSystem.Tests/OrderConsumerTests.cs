@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
+using Microsoft.Data.Sqlite;
 using Microsoft.Extensions.Logging.Abstractions;
 using OrderConsumer.Worker;
 using OrderPersistence;
@@ -370,17 +371,244 @@ public sealed class OrderConsumerTests
         Assert.Equal(("ack", 7UL, false, false), Assert.Single(calls.Settlements));
     }
 
+    [Fact]
+    public async Task Transient_order_failure_is_published_to_first_retry_queue_and_original_is_acked()
+    {
+        var processor = new FakeProcessor(_ => throw new IOException("Disk temporarily unavailable"));
+        var publisher = new FakeRetryPublisher();
+        var (channel, calls) = CreateChannel();
+        var properties = Properties("order-message-1", "correlation-1");
+
+        await CreateHandler(processor).HandleAsync(channel, Serialize(ValidOrder), 42,
+            CancellationToken.None, "order-message-1", properties, publisher);
+
+        var (message, queue) = Assert.Single(publisher.Published);
+        Assert.Equal("orders.retry.5s", queue);
+        Assert.Equal(1, message.Attempt);
+        Assert.Equal("order-message-1", message.MessageId);
+        Assert.Equal("correlation-1", message.CorrelationId);
+        Assert.Equal(nameof(OrderCreated), message.MessageType);
+        Assert.Same(properties, message.SourceProperties);
+        Assert.Equal(("ack", 42UL, false, false), Assert.Single(calls.Settlements));
+    }
+
+    [Theory]
+    [InlineData(0, "orders.retry.5s", 1)]
+    [InlineData(1, "orders.retry.30s", 2)]
+    [InlineData(2, "orders.retry.5m", 3)]
+    public async Task Transient_failure_selects_the_next_retry_stage(
+        int completedStages, string expectedQueue, int expectedAttempt)
+    {
+        var retryQueues = RetrySchedule.ForQueue("orders");
+        var completedNames = retryQueues.Take(completedStages).Select(queue => queue.QueueName).ToArray();
+        var processor = new FakeProcessor(_ => throw new TimeoutException("Database timeout"));
+        var publisher = new FakeRetryPublisher();
+        var (channel, calls) = CreateChannel();
+
+        await CreateHandler(processor).HandleAsync(channel, Serialize(ValidOrder), 42,
+            CancellationToken.None, "message-id",
+            Properties("message-id", headers: DeathHeaders(completedNames)), publisher);
+
+        var (message, queue) = Assert.Single(publisher.Published);
+        Assert.Equal(expectedQueue, queue);
+        Assert.Equal(expectedAttempt, message.Attempt);
+        Assert.Equal(("ack", 42UL, false, false), Assert.Single(calls.Settlements));
+    }
+
+    [Fact]
+    public async Task Exhausted_retries_are_dead_lettered_without_another_publish()
+    {
+        var allRetryQueues = RetrySchedule.ForQueue("orders").Select(queue => queue.QueueName).ToArray();
+        var processor = new FakeProcessor(_ => throw new TimeoutException("Database timeout"));
+        var publisher = new FakeRetryPublisher();
+        var (channel, calls) = CreateChannel();
+
+        await CreateHandler(processor).HandleAsync(channel, Serialize(ValidOrder), 42,
+            CancellationToken.None, "message-id",
+            Properties("message-id", headers: DeathHeaders(allRetryQueues)), publisher);
+
+        Assert.Empty(publisher.Published);
+        Assert.Equal(("nack", 42UL, false, false), Assert.Single(calls.Settlements));
+    }
+
+    [Fact]
+    public async Task Unexpected_retry_attempt_header_stops_the_loop_at_the_dlq()
+    {
+        var processor = new FakeProcessor(_ => throw new TimeoutException("Database timeout"));
+        var publisher = new FakeRetryPublisher();
+        var (channel, calls) = CreateChannel();
+        var headers = new Dictionary<string, object?>
+        {
+            [RetryHeaderInspector.RetryAttemptHeader] = 3L
+        };
+
+        await CreateHandler(processor).HandleAsync(channel, Serialize(ValidOrder), 42,
+            CancellationToken.None, "message-id",
+            Properties("message-id", headers: headers), publisher);
+
+        Assert.Empty(publisher.Published);
+        Assert.Equal(("nack", 42UL, false, false), Assert.Single(calls.Settlements));
+    }
+
+    [Fact]
+    public async Task Retry_publish_failure_leaves_the_original_delivery_unsettled()
+    {
+        var processor = new FakeProcessor(_ => throw new IOException("Disk temporarily unavailable"));
+        var failure = new IOException("Retry publish was not confirmed");
+        var publisher = new FakeRetryPublisher { Failure = failure };
+        var (channel, calls) = CreateChannel();
+
+        var error = await Assert.ThrowsAsync<IOException>(() => CreateHandler(processor).HandleAsync(
+            channel, Serialize(ValidOrder), 42, CancellationToken.None, "message-id",
+            Properties("message-id"), publisher));
+
+        Assert.Same(failure, error);
+        Assert.Empty(calls.Settlements);
+    }
+
+    [Fact]
+    public async Task Sqlite_busy_is_transient_and_routed_to_retry()
+    {
+        var processor = new FakeProcessor(_ => throw new SqliteException("database is locked", 5));
+        var publisher = new FakeRetryPublisher();
+        var (channel, calls) = CreateChannel();
+
+        await CreateHandler(processor).HandleAsync(channel, Serialize(ValidOrder), 42,
+            CancellationToken.None, "message-id", Properties("message-id"), publisher);
+
+        Assert.Equal("orders.retry.5s", Assert.Single(publisher.Published).QueueName);
+        Assert.Equal(("ack", 42UL, false, false), Assert.Single(calls.Settlements));
+    }
+
+    [Fact]
+    public async Task Sqlite_constraint_violation_is_permanent_and_dead_lettered()
+    {
+        var processor = new FakeProcessor(_ =>
+            throw new SqliteException("constraint failed", 19));
+        var publisher = new FakeRetryPublisher();
+        var (channel, calls) = CreateChannel();
+
+        await CreateHandler(processor).HandleAsync(channel, Serialize(ValidOrder), 42,
+            CancellationToken.None, "message-id", Properties("message-id"), publisher);
+
+        Assert.Empty(publisher.Published);
+        Assert.Equal(("nack", 42UL, false, false), Assert.Single(calls.Settlements));
+    }
+
+    [Fact]
+    public async Task Transient_deduplication_failure_is_routed_to_retry()
+    {
+        var store = new FailingOrderStore(new SqliteException("database is locked", 6));
+        var publisher = new FakeRetryPublisher();
+        var (channel, calls) = CreateChannel();
+
+        await CreateHandler(new FakeProcessor(), store).HandleAsync(channel, Serialize(ValidOrder), 42,
+            CancellationToken.None, "message-id", Properties("message-id"), publisher);
+
+        Assert.Equal("orders.retry.5s", Assert.Single(publisher.Published).QueueName);
+        Assert.Equal(("ack", 42UL, false, false), Assert.Single(calls.Settlements));
+    }
+
+    [Fact]
+    public async Task Duplicate_message_is_acked_even_when_it_has_retry_headers()
+    {
+        var store = new InMemoryOrderStore();
+        var processor = new FakeProcessor();
+        var publisher = new FakeRetryPublisher();
+        var (channel, calls) = CreateChannel();
+        const string messageId = "duplicate-with-retry-headers";
+        await store.MarkProcessedAsync(messageId, ValidOrder.OrderId, nameof(OrderCreated),
+            CancellationToken.None);
+
+        await CreateHandler(processor, store).HandleAsync(channel, Serialize(ValidOrder), 42,
+            CancellationToken.None, messageId,
+            Properties(messageId, headers: DeathHeaders("orders.retry.5s")), publisher);
+
+        Assert.Empty(processor.Orders);
+        Assert.Empty(publisher.Published);
+        Assert.Equal(("ack", 42UL, false, false), Assert.Single(calls.Settlements));
+    }
+
+    [Fact]
+    public async Task Transient_status_failure_uses_the_status_retry_queue()
+    {
+        var processor = new FakeStatusProcessor(_ => throw new TimeoutException("Database timeout"));
+        var publisher = new FakeRetryPublisher();
+        var (channel, calls) = CreateChannel();
+        var update = new OrderStatusChanged(Guid.NewGuid(), OrderStatus.Completed, DateTimeOffset.UtcNow);
+
+        await CreateStatusHandler(processor).HandleAsync(channel, Serialize(update), 7,
+            CancellationToken.None, "status-message-1",
+            Properties("status-message-1", "status-correlation"), publisher);
+
+        var (message, queue) = Assert.Single(publisher.Published);
+        Assert.Equal("orders.status.retry.5s", queue);
+        Assert.Equal("status-message-1", message.MessageId);
+        Assert.Equal("status-correlation", message.CorrelationId);
+        Assert.Equal(nameof(OrderStatusChanged), message.MessageType);
+        Assert.Equal(("ack", 7UL, false, false), Assert.Single(calls.Settlements));
+    }
+
+    [Fact]
+    public async Task Exhausted_status_retries_are_dead_lettered()
+    {
+        var allRetryQueues = RetrySchedule.ForQueue("orders.status")
+            .Select(queue => queue.QueueName).ToArray();
+        var processor = new FakeStatusProcessor(_ => throw new IOException("Disk temporarily unavailable"));
+        var publisher = new FakeRetryPublisher();
+        var (channel, calls) = CreateChannel();
+        var update = new OrderStatusChanged(Guid.NewGuid(), OrderStatus.Completed, DateTimeOffset.UtcNow);
+
+        await CreateStatusHandler(processor).HandleAsync(channel, Serialize(update), 7,
+            CancellationToken.None, "status-message-1",
+            Properties("status-message-1", headers: DeathHeaders(allRetryQueues)), publisher);
+
+        Assert.Empty(publisher.Published);
+        Assert.Equal(("nack", 7UL, false, false), Assert.Single(calls.Settlements));
+    }
+
+    private static BasicProperties Properties(string? messageId = null, string? correlationId = null,
+        IDictionary<string, object?>? headers = null) =>
+        new()
+        {
+            MessageId = messageId,
+            CorrelationId = correlationId,
+            Type = "OrderMessage",
+            ContentType = "application/json",
+            Headers = headers
+        };
+
+    private static Dictionary<string, object?> DeathHeaders(params string[] retryQueueNames)
+    {
+        var entries = retryQueueNames.Select(queueName => (object)new Dictionary<string, object>
+        {
+            ["queue"] = queueName,
+            ["reason"] = "expired",
+            ["count"] = 1L
+        }).ToList();
+
+        return new Dictionary<string, object?> { [RetryHeaderInspector.DeathHeader] = entries };
+    }
+
     private static byte[] Serialize<T>(T message) =>
         JsonSerializer.SerializeToUtf8Bytes(message, JsonSerializerOptions.Web);
 
-    private static OrderMessageHandler CreateHandler(IOrderProcessor processor, IOrderStore? store = null) =>
-        new(processor, store ?? new InMemoryOrderStore(), new RabbitMqSettings(),
-            NullLogger<OrderMessageHandler>.Instance);
+    private static OrderMessageHandler CreateHandler(IOrderProcessor processor, IOrderStore? store = null)
+    {
+        var settings = new RabbitMqSettings();
+        return new(processor, store ?? new InMemoryOrderStore(), settings,
+            NullLogger<OrderMessageHandler>.Instance,
+            new RetryScheduler(NullLogger<RetryScheduler>.Instance));
+    }
 
     private static OrderStatusMessageHandler CreateStatusHandler(IOrderStatusProcessor processor,
-        IOrderStore? store = null) =>
-        new(processor, store ?? new InMemoryOrderStore(), new RabbitMqSettings(),
-            NullLogger<OrderStatusMessageHandler>.Instance);
+        IOrderStore? store = null)
+    {
+        var settings = new RabbitMqSettings();
+        return new(processor, store ?? new InMemoryOrderStore(), settings,
+            NullLogger<OrderStatusMessageHandler>.Instance,
+            new RetryScheduler(NullLogger<RetryScheduler>.Instance));
+    }
 
     private static (IChannel Channel, ChannelProxy Calls) CreateChannel()
     {
@@ -456,6 +684,40 @@ public sealed class OrderConsumerTests
             CancellationToken cancellationToken)
         {
             _processedMessages.TryAdd(messageId, 0);
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class FailingOrderStore(Exception failure) : IOrderStore
+    {
+        public Task<OrderSnapshot?> GetAsync(Guid orderId, CancellationToken cancellationToken) =>
+            Task.FromException<OrderSnapshot?>(failure);
+
+        public Task<bool> TryCreateAsync(OrderCreated order, CancellationToken cancellationToken) =>
+            Task.FromException<bool>(failure);
+
+        public Task<OrderSnapshot?> ApplyStatusAsync(OrderStatusChanged update,
+            CancellationToken cancellationToken) => Task.FromException<OrderSnapshot?>(failure);
+
+        public Task<bool> TryDeleteAsync(Guid orderId, CancellationToken cancellationToken) =>
+            Task.FromException<bool>(failure);
+
+        public Task<bool> IsProcessedAsync(string messageId, CancellationToken cancellationToken) =>
+            Task.FromException<bool>(failure);
+
+        public Task MarkProcessedAsync(string messageId, Guid orderId, string messageType,
+            CancellationToken cancellationToken) => Task.FromException(failure);
+    }
+
+    private sealed class FakeRetryPublisher : IRetryPublisher
+    {
+        public List<(RetryMessage Message, string QueueName)> Published { get; } = [];
+        public Exception? Failure { get; set; }
+
+        public Task PublishAsync(RetryMessage message, string queueName, CancellationToken cancellationToken)
+        {
+            if (Failure is not null) return Task.FromException(Failure);
+            Published.Add((message, queueName));
             return Task.CompletedTask;
         }
     }
