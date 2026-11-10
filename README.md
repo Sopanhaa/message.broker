@@ -1,187 +1,326 @@
 # Order Messaging System
 
-## Project works
+A practical demo of asynchronous messaging with ASP.NET Core, a background worker, RabbitMQ, and SQLite.
 
-The API receives an order, stores it in a shared SQLite database, and sends an `OrderCreated` event to RabbitMQ. A separate worker reads that event, updates the order state, and records the message ID so redeliveries are not processed twice. The API and worker run independently, so RabbitMQ can hold messages while the worker is offline.
+## 1. Project Overview
 
-```mermaid
-flowchart TD
-    Client["Client"] -->|"POST /orders"| API["OrderProducer.Api: validate and persist"]
-    Client -->|"GET /orders/{id}"| API
-    Client -->|"PATCH /orders/{id}/status"| API
-    API --> DB["SQLite: order state and processed message IDs"]
-    API --> Publisher["RabbitMqPublisher"]
-    Publisher -->|"OrderCreated"| Queue["orders: durable queue"]
-    Publisher -->|"OrderStatusChanged"| StatusQueue["orders.status: durable queue"]
-    Queue --> Worker["OrderConsumer.Worker"]
-    StatusQueue --> Worker
-    Worker --> Dedupe["Skip message IDs already processed"]
-    Dedupe --> OrderPath["OrderMessageHandler -> OrderProcessor"]
-    Dedupe --> StatusPath["OrderStatusMessageHandler -> OrderStatusProcessor"]
-    OrderPath --> DB
-    StatusPath --> DB
-    Worker -->|"Success"| Ack["ACK: RabbitMQ removes the message"]
-    Worker -->|"Transient failure"| Retry["Retry queues: 5s → 30s → 5m"]
-    Retry -->|"TTL expires"| Queue
-    Retry -->|"TTL expires"| StatusQueue
-    Worker -->|"Permanent or unexpected failure"| Reject["NACK with requeue=false"]
-    Reject --> DLQ["dead-letter queues: inspect failed messages"]
-```
+OrderMessagingSystem accepts orders through a small HTTP API, saves them in SQLite, and publishes an `OrderCreated` message to RabbitMQ. A separate background worker consumes the message, simulates order processing, and updates the order status in the shared database. RabbitMQ is the message broker: it holds messages while the worker is offline and delivers them when the worker reconnects. The API and worker run as independent processes, but they use the same SQLite file and the same RabbitMQ queues. Status updates use a second queue, and failures are handled with retry queues and dead-letter queues (DLQs).
 
-### Order flow
+**Projects in the solution:**
 
-1. **Send a request.** The client calls `POST /orders` with `customerName`, `totalAmount`, and an optional `products` array. Each product contains `name`, `quantity`, and `unitPrice`.
-2. **Validate the request.** The API requires a customer name of 1–100 characters after trimming and an amount greater than zero. If products are supplied, the array must be nonempty, names must contain 1–100 characters after trimming, quantities must be positive integers, and unit prices must be positive. The sum of `quantity * unitPrice` must equal `totalAmount`. Invalid requests return `400 Bad Request` without publishing an event.
-3. **Create the event.** The API generates an `OrderId` and `CreatedAtUtc`, trims the customer name, and builds an `OrderCreated` event using the shared contract.
-4. **Persist the order.** The API inserts the order with status `Received` before publishing. If RabbitMQ does not confirm the publish, the API removes the row it just inserted and returns `503 Service Unavailable`, so a failed request does not leave an order behind.
-5. **Publish to RabbitMQ.** `RabbitMqPublisher` serializes the event as JSON and publishes a persistent message through the default exchange, using `orders` as the routing key. `OrderId` is the broker message ID. Both applications declare the same durable queues and dead-letter exchanges.
-6. **Return acceptance.** The API waits for RabbitMQ to confirm the publish before returning `202 Accepted` with the order ID and creation time. This confirms broker acceptance; processing may still be pending.
-7. **Check the order.** `GET /orders/{orderId}` returns the stored state: customer, total, products, status, status detail, and the time of the last status change. Unknown IDs return `404 Not Found`.
-8. **Consume and deduplicate.** `Worker` uses manual acknowledgments and a prefetch count of one per queue. Before processing, each handler checks the broker message ID against the `ProcessedMessages` table. A message that was already fully processed is acknowledged and skipped, which makes redelivery after a lost ACK harmless.
-9. **Process the order.** `OrderMessageHandler` deserializes and validates the event, then calls `IOrderProcessor.ProcessAsync`. `OrderProcessor` records `Processing`, logs the order and products, simulates work with a one-second delay, and records `Completed`. Status writes only apply when their timestamp is newer than the stored one.
-10. **Acknowledge completion.** After processing completes, the handler records the message ID as processed and sends an ACK. RabbitMQ removes the message, and the worker logs **Processed and acknowledged order**. A transient infrastructure failure is published to a delayed retry queue instead; the original message is ACKed only after RabbitMQ confirms that retry publish.
-11. **Update the status.** The client calls `PATCH /orders/{orderId}/status` with a `status` (`Received`, `Processing`, `Completed`, or `Failed`) and an optional `detail` of up to 500 characters. The API validates the request and returns `404 Not Found` if the order does not exist. It then publishes `OrderStatusChanged` to the `orders.status` queue and returns `202 Accepted` after broker confirmation. Invalid requests return `400 Bad Request` without publishing. The worker applies the update, so `GET /orders/{orderId}` may show the previous status for a moment.
-12. **Consume status updates.** The same `Worker` consumes `orders.status` on its own channel with its own prefetch and manual acknowledgments. It deduplicates by message ID, validates each update, then `OrderStatusProcessor` applies it to the shared database. Older or duplicate updates are ignored, so redelivery and out-of-order messages are safe. Transient status failures use `orders.status.retry.*`; invalid or permanently failed status messages are rejected to `orders.status.dead-letter`.
-
-## Reliability: retry before the dead-letter queue
-
-Without retries, a short-lived failure such as a locked SQLite file or a brief timeout sends a perfectly valid message straight to the DLQ. The order is then stuck until an operator replays it. The worker therefore retries **transient** failures on a bounded schedule and keeps the **DLQ for permanent failures and exhausted retries**.
-
-### Failure classification
-
-| Classification | Examples | Action |
-| --- | --- | --- |
-| Permanent | Invalid JSON, missing/invalid schema, business validation failure | NACK with `requeue=false`; RabbitMQ dead-letters to the DLQ |
-| Transient | `IOException`, `TimeoutException`, SQLite `SQLITE_BUSY` (5), SQLite `SQLITE_LOCKED` (6), including these errors wrapped in EF Core exceptions | Publish to the next retry queue, wait for broker confirmation, then ACK the original delivery |
-| Unexpected | Any other exception, including non-recoverable SQLite errors | Logged at error level and dead-lettered to the DLQ (a documented bounded policy, not an infinite retry loop) |
-
-Not every `SqliteException` is retried. Only error codes 5 and 6 are treated as recoverable; for example, `SQLITE_CONSTRAINT` (19) is permanent.
-
-### Retry topology
+| Folder | Purpose |
+| --- | --- |
+| `OrderProducer.Api` | Minimal API: create and query orders, publish events |
+| `OrderConsumer.Worker` | Background worker: consume orders and status updates, retry failures, update SQLite |
+| `OrderPersistence` | EF Core and SQLite storage, including the message deduplication table |
+| `Shared.Contracts` | Event records, RabbitMQ settings, queue topology, retry helpers |
+| `OrderMessagingSystem.Tests` | Unit tests and optional RabbitMQ integration tests |
 
 ```mermaid
 flowchart LR
-    Producer["Producer"] --> Main["Main queue<br/>orders / orders.status"]
-    Main --> Consumer["Consumer"]
-    Consumer -->|"Transient failure"| Retry5["Retry queue 5s"]
-    Retry5 -->|"TTL expires"| Main
-    Consumer -->|"Transient failure"| Retry30["Retry queue 30s"]
-    Retry30 -->|"TTL expires"| Main
-    Consumer -->|"Transient failure"| Retry5m["Retry queue 5m"]
-    Retry5m -->|"TTL expires"| Main
-    Consumer -->|"Permanent failure or retries exhausted"| DLQ["Dead-letter queue<br/>orders.dead-letter / orders.status.dead-letter"]
+    Client["Client"] --> API["OrderProducer.Api"]
+    API --> DB[("SQLite")]
+    API -->|"OrderCreated / OrderStatusChanged"| MQ["RabbitMQ"]
+    MQ --> Worker["OrderConsumer.Worker"]
+    Worker --> DB
+    Worker -->|"transient failure"| Retry["Retry queues: 5s / 30s / 5m"]
+    Retry --> MQ
+    Worker -->|"permanent failure"| DLQ["Dead-letter queues"]
 ```
 
-Each main queue has three durable retry queues. A retry queue has `x-message-ttl` set to its delay and `x-dead-letter-exchange` pointing at the existing `<queue>.dlx` exchange. Expired messages are routed back to the original main queue with the `<queue>.retry.return` routing key; permanent failures from the main queue use the existing `<queue>` routing key to reach the DLQ.
+## 2. Prerequisites
 
-| Attempt | Order queue | Status queue | Delay |
-| --- | --- | --- | --- |
-| 1 | `orders.retry.5s` | `orders.status.retry.5s` | 5 seconds |
-| 2 | `orders.retry.30s` | `orders.status.retry.30s` | 30 seconds |
-| 3 | `orders.retry.5m` | `orders.status.retry.5m` | 5 minutes |
-| Exhausted | `orders.dead-letter` | `orders.status.dead-letter` | No further retry |
+Install these tools before you start:
 
-### Attempt tracking and safety
+| Tool | Why you need it | Official link |
+| --- | --- | --- |
+| .NET 10 SDK | Build and run the API, worker, and tests | https://dotnet.microsoft.com/download/dotnet/10.0 |
+| Docker Engine or Docker Desktop | Run RabbitMQ in a container | https://docs.docker.com/engine/install/ or https://www.docker.com/products/docker-desktop/ |
+| Docker Compose v2 | Start RabbitMQ with one command | Included with Docker Desktop and current Docker Engine |
+| Git | Clone the repository | https://git-scm.com/downloads |
+| VS Code (optional) | Edit and debug the code | https://code.visualstudio.com/ |
+| Postman (optional) | Send HTTP requests with a graphical UI | https://www.postman.com/downloads/ |
 
-- The handler reads RabbitMQ's `x-death` header and considers only entries where `reason=expired` and `queue` is one of the retry queues. It advances to the stage after the furthest completed retry queue, so duplicate copies cannot skip ahead. Rejections from the main queue (`reason=rejected`) and unrelated dead-letter events do not advance the schedule.
-- The retry publisher also writes `x-retry-attempt` (`1`, `2`, or `3`) as an independent guard. If `x-death` were lost or stripped, this header still stops the loop at the DLQ.
-- Retry messages preserve the original payload, `MessageId`, `CorrelationId`, message type, and headers. The original `MessageId` is kept, so deduplication and idempotent status writes continue to work.
-- A failed message is never recorded in `ProcessedMessages`. On redelivery, the work is retried; order creation is guarded by the order ID, and status updates are timestamp-guarded.
-- For a transient failure, the worker publishes to the retry queue on a **publisher-confirm** channel and ACKs the original delivery only after the broker confirms the retry publish. If the publish is not confirmed, the handler leaves the original delivery unsettled; the worker reconnects and RabbitMQ requeues it. An ambiguous confirmation can produce a duplicate retry copy, which is safe because processing is deduplicated and idempotent.
-- NACK with `requeue=false` uses the main queue's configured dead-letter exchange. The worker never assumes that a NACK can target an arbitrary queue.
-- Order and status consumers each have their own channel, and the retry publisher has a separate confirm-enabled channel. A semaphore serializes publishes on that channel, so no channel is shared by concurrent operations.
-
-### Test retries locally
-
-1. Start RabbitMQ, the API, and the worker as described below. Create an order so you have an order ID to update.
-2. Hold a write lock on the shared database for longer than the five-second SQLite busy timeout. In a separate terminal:
-
-   ```bash
-   sqlite3 ~/.local/share/OrderMessagingSystem/orders.db
-   BEGIN EXCLUSIVE;
-   ```
-
-3. While the lock is held, send a status update with the API. The API can still read under WAL and publish, but the worker's status write hits SQLite busy. The worker logs a transient failure and publishes to `orders.status.retry.5s`; the original status message is ACKed only after that publish is confirmed.
-4. Release the lock with `COMMIT;` and exit. When the five-second TTL expires, the message returns to `orders.status` and the retry succeeds.
-
-   > `sqlite3` must be installed for this manual test. You can also rely on the classification and handler tests, which simulate the same failures without a broker:
-
-   ```bash
-   dotnet test OrderMessagingSystem.slnx --filter "FullyQualifiedName~OrderConsumerTests|FullyQualifiedName~RetryHeaderInspectorTests"
-   ```
-
-### Inspect retry queues
-
-Open **http://localhost:15673** and select **Queues and Streams**. You should see the main queues, the three retry queues per stream, and the DLQs:
-
-- `orders` and `orders.status` — live work.
-- `orders.retry.5s`, `orders.retry.30s`, `orders.retry.5m` — delayed order retries.
-- `orders.status.retry.5s`, `orders.status.retry.30s`, `orders.status.retry.5m` — delayed status retries.
-- `orders.dead-letter` and `orders.status.dead-letter` — permanent failures or exhausted retries.
-
-Retry queues have no consumers: their Ready count drops when a message's TTL expires. Open a message to inspect its `x-death` entries and `x-retry-attempt` header. Retry queues normally drain themselves; the DLQs keep messages until you inspect or replay them. Use the management UI's **Get messages** action carefully and requeue messages you do not intend to consume.
-
-The optional integration tests verify the retry queue TTLs through the management API and measure the first retry against a real broker:
+Check the installed versions:
 
 ```bash
-RABBITMQ_INTEGRATION_TESTS=1 dotnet test OrderMessagingSystem.slnx \
-  --filter "FullyQualifiedName~RabbitMqIntegrationTests"
+dotnet --version
+docker --version
+docker compose version
+git --version
 ```
 
-They require the Docker RabbitMQ instance and are reported as skipped when `RABBITMQ_INTEGRATION_TESTS` is not set. The 30-second and 5-minute delays are verified by the schedule/topology tests rather than by waiting in the test suite.
+`dotnet --version` must print a **10.x** version. If it prints a lower version, install the .NET 10 SDK.
 
-## Requirement
+**Supported operating systems:** Windows 10/11, macOS, and Linux. RabbitMQ runs in a Linux container, so Docker Desktop (Windows/macOS) or Docker Engine (Linux) is required. The commands below use bash/zsh syntax. On Windows, use WSL, Git Bash, or adapt the environment variables to PowerShell.
 
- install **.NET 10 SDK**, **Docker with Docker Compose**, and **curl**. Make sure Docker is running.
+## 3. Clone the Repository
 
-Open a terminal in the `OrderMessagingSystem` folder. Use this folder in each new terminal below.
+Open a terminal in the folder where you keep your projects, then run:
 
-## 1.Run Build 
+```bash
+git clone https://github.com/Sopanhaa/message.broker.git
+cd message.broker
+```
 
-Run this command 
+The repository root is the folder that contains `OrderMessagingSystem.slnx`. Run every command in this README from that folder unless a step says otherwise.
+
+Quick check:
+
+```bash
+ls
+```
+
+You should see `OrderMessagingSystem.slnx`, `docker-compose.yml`, `README.md`, and the project folders.
+
+## 4. Configure the Project
+
+The default configuration works on a local computer. You do not need to edit any file for the first run.
+
+### RabbitMQ settings
+
+Both `OrderProducer.Api/appsettings.json` and `OrderConsumer.Worker/appsettings.json` contain the same section:
+
+```json
+"RabbitMq": {
+  "HostName": "localhost",
+  "Port": 5673,
+  "UserName": "orderdev",
+  "Password": "orderdev_password",
+  "VirtualHost": "/",
+  "QueueName": "orders",
+  "PublishTimeoutSeconds": 10
+}
+```
+
+- **Port `5673`** is the host port mapped to RabbitMQ's AMQP port `5672` inside Docker.
+- **`orderdev` / `orderdev_password`** are development-only credentials. Do not reuse them on a public server.
+- **`QueueName`** is the base name. The app also uses `orders.status`, the retry queues, and two dead-letter queues.
+- **Both files must match.** If the API and worker use different credentials, ports, or queue names, they cannot communicate.
+
+### Docker Compose settings
+
+`docker-compose.yml` creates the RabbitMQ user from these variables:
+
+```yaml
+RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-orderdev}
+RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-orderdev_password}
+```
+
+If you change `RABBITMQ_USER` or `RABBITMQ_PASSWORD`, also change `RabbitMq:UserName` and `RabbitMq:Password` in **both** `appsettings.json` files. RabbitMQ applies these variables only when its data volume is first initialized.
+
+### SQLite database
+
+Both apps use one shared SQLite file:
+
+| Operating system | Default path |
+| --- | --- |
+| Linux | `~/.local/share/OrderMessagingSystem/orders.db` |
+| macOS | `~/Library/Application Support/OrderMessagingSystem/orders.db` |
+| Windows | `%LOCALAPPDATA%\OrderMessagingSystem\orders.db` |
+
+The folder and schema are created automatically on startup. The API and worker must point to the **same file**.
+
+To use a different location, set `Database__Path` in both terminals:
+
+```bash
+# Terminal 2 (API)
+Database__Path=/tmp/orders.db dotnet run --project OrderProducer.Api
+
+# Terminal 3 (Worker)
+Database__Path=/tmp/orders.db dotnet run --project OrderConsumer.Worker
+```
+
+A relative path is resolved under the default `OrderMessagingSystem` folder. If you set this variable for only one process, the two apps will use different databases and the worker will not find the API's orders.
+
+### Environment variables
+
+You can override configuration without editing JSON:
+
+| Variable | Example |
+| --- | --- |
+| `RabbitMq__HostName` | `localhost` |
+| `RabbitMq__Port` | `5673` |
+| `RabbitMq__UserName` | `orderdev` |
+| `RabbitMq__Password` | `orderdev_password` |
+| `RabbitMq__VirtualHost` | `/` |
+| `RabbitMq__QueueName` | `orders` |
+| `RabbitMq__PublishTimeoutSeconds` | `10` |
+| `Database__Path` | `/tmp/orders.db` |
+
+Use a double underscore (`__`) to separate nested keys. On PowerShell, set a variable with `$env:Database__Path="C:\temp\orders.db"`.
+
+> `GET /health` is a liveness check only. It returns `200` even when RabbitMQ is down. Use `docker compose ps` to check RabbitMQ.
+
+## 5. Start RabbitMQ with Docker
+
+Make sure Docker is running, then run this from the repository root:
+
+```bash
+docker compose up -d --wait
+```
+
+`--wait` returns when the container health check passes. You should see output ending with **Healthy**.
+
+Verify:
+
+```bash
+docker compose ps
+```
+
+The `rabbitmq` service should show `Up ... (healthy)` and these ports:
+
+- `127.0.0.1:5673->5672/tcp` — AMQP
+- `127.0.0.1:15673->15672/tcp` — Management UI
+
+If the container is not healthy yet, wait a few seconds and run `docker compose ps` again. You can also watch the logs:
+
+```bash
+docker compose logs -f rabbitmq
+```
+
+Press `Ctrl+C` to stop watching the logs. This does not stop RabbitMQ.
+
+### RabbitMQ Management UI
+
+Open **http://localhost:15673** in your browser.
+
+Use the development login:
+
+| Username | Password |
+| --- | --- |
+| `orderdev` | `orderdev_password` |
+
+These values come from `docker-compose.yml`, or from your `RABBITMQ_USER` / `RABBITMQ_PASSWORD` environment variables. If the login fails, see Section 13.
+
+The Management UI is bound to `127.0.0.1`, so it is reachable only from your computer.
+
+## 6. Restore and Build
+
+From the repository root:
+
+```bash
+dotnet restore
+dotnet build
+```
+
+Both commands find `OrderMessagingSystem.slnx` automatically. If your terminal does not find it, run:
 
 ```bash
 dotnet restore OrderMessagingSystem.slnx
-dotnet build OrderMessagingSystem.slnx --no-restore
+dotnet build OrderMessagingSystem.slnx
 ```
 
-You should see **Build succeeded**.
+A successful build ends with:
 
-## 2. Start RabbitMQ
+```text
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+```
 
-RabbitMQ holds orders until they are processed.
+### If the SDK is missing
+
+If you see `dotnet: command not found`, install the .NET 10 SDK from https://dotnet.microsoft.com/download/dotnet/10.0 and open a new terminal.
+
+If you see `NETSDK1045`, the installed SDK is too old. Check the installed SDKs:
 
 ```bash
-sudo docker compose up -d --wait
+dotnet --list-sdks
 ```
 
-Enter your computer password if asked. Wait until it shows **Healthy**.
+Install a **10.x** SDK and try again.
 
-## 3. Start the order processor — terminal 1
+## 7. Run the API
 
-In the same terminal, run:
-
-```bash
-dotnet run --project OrderConsumer.Worker
-```
-
-Wait for **Waiting for orders in orders and status updates in orders.status**. Leave this terminal running.
-
-## 4. Start the API — terminal 2
-
-The API receives the orders you send.
-
-Open a **second terminal** in `OrderMessagingSystem` and run:
+Open a terminal in the repository root. This is **Terminal 2** if you started RabbitMQ in Terminal 1.
 
 ```bash
 dotnet run --project OrderProducer.Api
 ```
 
-Wait for **http://localhost:5000**. Leave this terminal running too.
+Wait for:
 
-## 5. Send an order — terminal 3
+```text
+Now listening on: http://localhost:5000
+Application started. Press Ctrl+C to shut down.
+```
 
-Open a **third terminal** and paste this whole command:
+The API listens on **http://localhost:5000** (configured in `OrderProducer.Api/Properties/launchSettings.json`). It creates the SQLite database on startup.
+
+Quick check in another terminal:
+
+```bash
+curl http://localhost:5000/health
+```
+
+Expected:
+
+```json
+{"status":"healthy","check":"liveness"}
+```
+
+Leave this terminal running. Stop the API with `Ctrl+C`.
+
+> The API connects to RabbitMQ lazily, on the first publish. It can start while RabbitMQ is down, but `POST /orders` will return `503`.
+
+## 8. Run the Worker
+
+Open another terminal (**Terminal 3**) in the repository root. The API must keep running.
+
+```bash
+dotnet run --project OrderConsumer.Worker
+```
+
+Wait for:
+
+```text
+Waiting for orders in orders and status updates in orders.status; prefetch=1 per queue, manual acknowledgments enabled
+```
+
+This means the worker connected to RabbitMQ, declared the main queues, retry queues, and dead-letter exchanges, and is waiting for messages.
+
+If RabbitMQ is not ready, the worker logs `Consumer connection failed` and retries every 5 seconds. Start RabbitMQ and watch it recover.
+
+Leave this terminal running. Stop the worker with `Ctrl+C`.
+
+## 9. Test the Project Step by Step
+
+### Step 1 — Check RabbitMQ
+
+```bash
+docker compose ps
+```
+
+The `rabbitmq` service must be `healthy`.
+
+### Step 2 — Start the API
+
+In **Terminal 2**:
+
+```bash
+dotnet run --project OrderProducer.Api
+```
+
+Wait for `Now listening on: http://localhost:5000`.
+
+### Step 3 — Start the Worker
+
+In **Terminal 3**:
+
+```bash
+dotnet run --project OrderConsumer.Worker
+```
+
+Wait for `Waiting for orders in orders and status updates in orders.status`.
+
+### Step 4 — Open a request terminal
+
+Use **Postman** or open **Terminal 4**. The examples below use `curl`.
+
+> On Windows PowerShell, `curl` is an alias for `Invoke-WebRequest`. Use `curl.exe` or Postman instead.
+
+### Step 5 — Send an order
 
 ```bash
 curl -i -X POST http://localhost:5000/orders \
@@ -189,72 +328,359 @@ curl -i -X POST http://localhost:5000/orders \
   -d '{"customerName":"Sopanha","totalAmount":50.00,"products":[{"name":"Keyboard","quantity":2,"unitPrice":20.00},{"name":"Mouse","quantity":1,"unitPrice":10.00}]}'
 ```
 
-You should receive **202 Accepted**. This means RabbitMQ confirmed the published order; processing may still be pending.
+If you use Postman:
 
-Check the **first terminal** for **Processed and acknowledged order**. Your project is working!
+- Method: `POST`
+- URL: `http://localhost:5000/orders`
+- Header: `Content-Type: application/json`
+- Body → raw → JSON: the JSON shown above.
 
-You can send another order by running the command again. Change the customer and products, keeping `totalAmount` equal to the sum of the product amounts. Product names are trimmed before publishing, and product details are included in the `OrderCreated` message and logged by the worker. Orders without `products` remain supported, including older queued messages.
+### Step 6 — Check the API response
 
-### Query an order
+A successful request returns `HTTP/1.1 202 Accepted` and a body like this:
 
-Use the `orderId` from the `202 Accepted` response:
+```json
+{
+  "orderId": "1c560764-7af9-4af8-843a-107e0e899dc2",
+  "status": "accepted",
+  "createdAtUtc": "2026-11-10T07:31:21.5687367+00:00"
+}
+```
+
+**This is example output.** Your `orderId` and `createdAtUtc` will be different. Copy the `orderId`; you will need it in Step 9.
+
+If you get `400 Bad Request`, check that `totalAmount` equals the sum of `quantity * unitPrice` for all products. If you get `503 Service Unavailable`, RabbitMQ is not reachable.
+
+### Step 7 — Watch the worker
+
+Switch to **Terminal 3**. Within a second or two you should see:
+
+```text
+Processing order <your-order-id>: customer=Sopanha, total=50.00
+Order product: name=Keyboard, quantity=2, unitPrice=20.00
+Order product: name=Mouse, quantity=1, unitPrice=10.00
+Completed order <your-order-id>
+Processed and acknowledged order <your-order-id>
+```
+
+**This is example output.** The order ID and timestamps will differ. You may also see EF Core SQL command logs; they are normal.
+
+### Step 8 — Check RabbitMQ
+
+1. Open **http://localhost:15673**.
+2. Sign in with `orderdev` / `orderdev_password`.
+3. Select **Queues and Streams**.
+
+You should see:
+
+| Queue | What it is |
+| --- | --- |
+| `orders` | New orders waiting to be processed |
+| `orders.status` | Status updates waiting to be applied |
+| `orders.retry.5s`, `orders.retry.30s`, `orders.retry.5m` | Delayed order retries |
+| `orders.status.retry.5s`, `orders.status.retry.30s`, `orders.status.retry.5m` | Delayed status retries |
+| `orders.dead-letter` | Orders that failed permanently |
+| `orders.status.dead-letter` | Status updates that failed permanently |
+
+An empty `orders` queue is normal: the worker may have already processed the message. Retry queues have no consumers and drain themselves when their TTL expires.
+
+### Step 9 — Check the saved order
+
+Use the `orderId` from Step 6:
 
 ```bash
 curl -i http://localhost:5000/orders/PASTE_ORDER_ID_HERE
 ```
 
-The response contains the stored customer, total, products, status, status detail, and the time of the last status change. Right after creation the status is `Received`; it becomes `Processing` and then `Completed` as the worker runs. An unknown ID returns `404 Not Found`.
+Expected structure:
 
-### Update an order status
+```json
+{
+  "orderId": "1c560764-7af9-4af8-843a-107e0e899dc2",
+  "customerName": "Sopanha",
+  "totalAmount": 50.0,
+  "createdAtUtc": "2026-11-10T07:31:21.5687367+00:00",
+  "products": [
+    { "name": "Keyboard", "quantity": 2, "unitPrice": 20.00 },
+    { "name": "Mouse", "quantity": 1, "unitPrice": 10.00 }
+  ],
+  "status": "Completed",
+  "statusDetail": null,
+  "statusUpdatedAtUtc": "2026-11-10T07:31:23.4708658+00:00"
+}
+```
 
-Copy the `orderId` from the `202 Accepted` response and send a status update. The worker logs the new state and ignores older or duplicate updates:
+**This is example output.** Right after creation, the status may still be `Received` or `Processing`. Wait one or two seconds and request it again; it should become `Completed`.
+
+#### Optional: update the status
 
 ```bash
 curl -i -X PATCH http://localhost:5000/orders/PASTE_ORDER_ID_HERE/status \
   -H 'Content-Type: application/json' \
-  -d '{"status":"Completed","detail":"Delivered to customer"}'
+  -d '{"status":"Failed","detail":"Manual review"}'
 ```
 
-Accepted status values are `Received`, `Processing`, `Completed`, and `Failed`. `detail` is optional, trimmed, and limited to 500 characters. You should receive **202 Accepted**; check the worker terminal for **status updated to Completed**.
+The API returns `202 Accepted`. After the worker applies the update, `GET /orders/{id}` shows `"status": "Failed"` and `"statusDetail": "Manual review"`.
 
-## 6. View the dashboard — optional
+Accepted status values are `Received`, `Processing`, `Completed`, and `Failed`. `detail` is optional and limited to 500 characters.
 
-Open **http://localhost:15673** in your browser and sign in:
+#### Optional: query SQLite directly
 
-| Username | Password |
+The `sqlite3` command is not required to use the project:
+
+```bash
+sqlite3 ~/.local/share/OrderMessagingSystem/orders.db \
+  "SELECT OrderId, Status, StatusDetail FROM Orders ORDER BY CreatedAtUtc DESC LIMIT 5;"
+```
+
+On macOS, replace the path with `~/Library/Application Support/OrderMessagingSystem/orders.db`. On Windows, replace it with `%LOCALAPPDATA%\OrderMessagingSystem\orders.db`. If you set `Database__Path`, use that file instead.
+
+## 10. Test Retry and DLQ
+
+The worker retries **transient** failures and keeps permanent failures in the dead-letter queue (DLQ). The worker writes its logs to the terminal where you started it, so check that terminal first when a message is not processed.
+
+### What is retried
+
+| Failure | Action |
 | --- | --- |
-| `orderdev` | `orderdev_password` |
+| Invalid JSON or invalid order data | Sent directly to the DLQ; retrying cannot fix the payload |
+| `IOException`, `TimeoutException`, SQLite busy/locked errors (including wrapped errors) | Retried on a 5s → 30s → 5m schedule, then sent to the DLQ |
+| Any other unexpected exception | Sent to the DLQ |
 
-Select **Queues and Streams**. You should see `orders` and `orders.status` for live work, the `.retry.5s`, `.retry.30s`, and `.retry.5m` queues for delayed retries, plus `orders.dead-letter` and `orders.status.dead-letter` for rejected messages. An empty queue is normal: the processor may have already finished the messages, and retry queues drain themselves when their TTL expires.
+The retry queues are:
 
-## 7. Stop when finished
+| Attempt | Order queue | Status queue | Delay |
+| --- | --- | --- | --- |
+| 1 | `orders.retry.5s` | `orders.status.retry.5s` | 5 seconds |
+| 2 | `orders.retry.30s` | `orders.status.retry.30s` | 30 seconds |
+| 3 | `orders.retry.5m` | `orders.status.retry.5m` | 5 minutes |
+| After 3 | `orders.dead-letter` | `orders.status.dead-letter` | No more retries |
 
-Press **Ctrl+C** in the first and second terminals. Then run this in the third terminal:
+Each retry preserves the original payload and message ID. The worker acknowledges the original delivery only after RabbitMQ confirms the retry publish.
+
+### Observe a retry (optional, local only)
+
+This simulates a temporary database lock. It does not change production data.
+
+1. Create an order and copy its ID (Step 5 and Step 6).
+
+2. Open the database in another terminal:
+
+   ```bash
+   sqlite3 ~/.local/share/OrderMessagingSystem/orders.db
+   ```
+
+   On macOS, use `~/Library/Application Support/OrderMessagingSystem/orders.db`. On Windows, use `%LOCALAPPDATA%\OrderMessagingSystem\orders.db`.
+
+   Then run:
+
+   ```sql
+   BEGIN EXCLUSIVE;
+   ```
+
+3. Send a status update for the order:
+
+   ```bash
+   curl -i -X PATCH http://localhost:5000/orders/PASTE_ORDER_ID_HERE/status \
+     -H 'Content-Type: application/json' \
+     -d '{"status":"Failed","detail":"retry demo"}'
+   ```
+
+4. Wait about **6 seconds**. The worker's SQLite busy timeout is 5 seconds, so it first waits, then schedules a retry. In the worker terminal you should see:
+
+   ```text
+   Delivery <delivery-tag> failed transiently; scheduled retry 1/3 in orders.status.retry.5s after 5 seconds
+   ```
+
+   In the Management UI, `orders.status.retry.5s` should show `Ready: 1`. The counters may take a few seconds to update.
+
+5. Release the lock in the `sqlite3` terminal:
+
+   ```sql
+   COMMIT;
+   ```
+
+   Then exit with `.quit`.
+
+6. After about 5 more seconds, the message returns to `orders.status`. The worker logs:
+
+   ```text
+   Order <order-id> status updated to Failed: retry demo
+   Processed and acknowledged status update for order <order-id>
+   ```
+
+   The retry queue returns to `Ready: 0`, and `GET /orders/{id}` shows `Failed`.
+
+If you cannot install `sqlite3`, use the automated retry tests below instead.
+
+### Send a message to the DLQ safely
+
+This uses the RabbitMQ Management UI and an invalid test message. It does not change application code.
+
+1. Make sure the worker is running.
+
+2. Open **http://localhost:15673** → **Queues and Streams** → `orders`.
+
+3. Expand **Publish message**.
+
+4. Set **Payload** to:
+
+   ```json
+   {"this":"is not a valid order"}
+   ```
+
+5. Click **Publish message**.
+
+6. The worker rejects the payload and logs:
+
+   ```text
+   Delivery ... has an invalid payload; rejecting to orders.dead-letter
+   ```
+
+7. `orders.dead-letter` now shows `Ready: 1`. Expand the queue and use **Get messages** to inspect it.
+
+The project does not include an automatic DLQ replay tool. Treat DLQ messages as failed messages that need manual investigation.
+
+### Automated retry tests
+
+These unit tests do not need RabbitMQ:
 
 ```bash
-sudo docker compose down
+dotnet test --filter "FullyQualifiedName~OrderConsumerTests|FullyQualifiedName~ProcessingFailureClassifierTests|FullyQualifiedName~RetryHeaderInspectorTests|FullyQualifiedName~RetryPublisherTests|FullyQualifiedName~RabbitMqTopologyTests"
 ```
 
-Your saved messages are kept.
+Expected: **92 passed**.
 
-### Where the data is stored
-
-The API and the worker share a SQLite database at `~/.local/share/OrderMessagingSystem/orders.db`. The schema is created on startup. Set `Database__Path` in both terminals to use a different file (for example, `Database__Path=/tmp/orders.db`); relative paths are resolved under that shared folder. Delete the file to start with a clean database. The database holds order state and processed message IDs; RabbitMQ still holds queued messages.
-
-To run the project again, start RabbitMQ with the command below, then repeat steps **3–5**:
+These integration tests need RabbitMQ and take about 6 seconds. They check the retry TTLs, the first 5-second retry, and retry metadata:
 
 ```bash
-sudo docker compose up -d --wait
+RABBITMQ_INTEGRATION_TESTS=1 dotnet test --filter "FullyQualifiedName~RabbitMqIntegrationTests"
 ```
 
-## Run the tests
+Expected: **3 passed**.
 
-Run the API and consumer tests from `OrderMessagingSystem`:
+The 30-second and 5-minute delays are covered by the schedule and topology unit tests; the integration suite does not wait for them.
+
+## 11. Run Automated Tests
+
+From the repository root:
 
 ```bash
-dotnet test OrderMessagingSystem.slnx
+dotnet test
 ```
 
-The unit tests cover request validation, broker-confirmation behavior, persistence and stale-status guards, consumer deduplication by message ID, order processing, acknowledgement and dead-letter paths, transient/permanent failure classification, retry-stage selection from `x-death`, retry-queue topology, message identity preservation, status updates, and stale or duplicate status handling. They do not need a running RabbitMQ instance.
+Expected result on a clean run:
 
-Three opt-in integration tests run against the Docker RabbitMQ instance when `RABBITMQ_INTEGRATION_TESTS=1` is set. They verify the declared retry TTLs, the real first-retry timing, and that a republished retry keeps its `x-death` metadata; without the environment variable they are reported as skipped.
+```text
+Passed!  - Failed: 0, Passed: 134, Skipped: 3, Total: 137
+```
+
+**This result was verified on this repository.** The three skipped tests are the opt-in RabbitMQ integration tests.
+
+- The default test run **does not need RabbitMQ**.
+- The default tests use temporary SQLite files, and the opt-in integration tests use temporary RabbitMQ queue names, so they do not touch your local order database or the main queues.
+- To include the integration tests, start RabbitMQ and run:
+
+  ```bash
+  RABBITMQ_INTEGRATION_TESTS=1 dotnet test --filter "FullyQualifiedName~RabbitMqIntegrationTests"
+  ```
+
+  Expected: `Passed: 3`.
+
+On PowerShell:
+
+```powershell
+$env:RABBITMQ_INTEGRATION_TESTS="1"
+dotnet test --filter "FullyQualifiedName~RabbitMqIntegrationTests"
+```
+
+If a test fails, read the first `Failed` block and its stack trace. Common causes are a stopped RabbitMQ container (integration tests only) or a leftover process using the same port.
+
+## 12. Stop the Project
+
+Stop the applications first:
+
+1. Worker terminal: press `Ctrl+C`.
+2. API terminal: press `Ctrl+C`.
+3. Stop RabbitMQ:
+
+   ```bash
+   docker compose down
+   ```
+
+`docker compose down` stops and removes the containers but keeps the named volume `rabbitmq_data`. Queued messages survive.
+
+`docker compose down -v` also deletes the volume. **This permanently deletes RabbitMQ data**, including queued messages and any custom users. Use it only when you want a clean broker.
+
+The SQLite file is not managed by Docker and survives `docker compose down`. To reset it:
+
+```bash
+rm ~/.local/share/OrderMessagingSystem/orders.db
+```
+
+On macOS, delete `~/Library/Application Support/OrderMessagingSystem/orders.db`. On Windows, delete `%LOCALAPPDATA%\OrderMessagingSystem\orders.db`. This removes order history and deduplication records; the schema is recreated on the next startup.
+
+Prefer `docker compose stop` if you only want to pause RabbitMQ but keep the containers.
+
+## 13. Troubleshooting
+
+| Problem | Fix |
+| --- | --- |
+| `docker: command not found` or Docker is not running | Start Docker Desktop (Windows/macOS) or the Docker service (Linux). Check with `docker info`. |
+| `docker compose: command not found` | Install the Docker Compose v2 plugin (https://docs.docker.com/compose/install/linux/), or use Docker Desktop, which includes it. |
+| `RabbitMQ connection refused` | Run `docker compose ps`. Wait for `healthy`. If it is not running, run `docker compose up -d --wait`. Check `docker compose logs rabbitmq`. |
+| Port `5673` or `15673` is already in use | Stop the other service using the port (`ss -ltnp \| grep 5673` on Linux, `lsof -i :5673` on macOS). Or change the host ports in `docker-compose.yml` and `RabbitMq:Port` in both `appsettings.json` files. |
+| Port `5000` is already in use | Stop the process using it (`ss -ltnp \| grep 5000` or `lsof -i :5000`), then start the API again. |
+| API fails to start | Run `dotnet build` and read the first error. Confirm the .NET 10 SDK is installed (`dotnet --list-sdks`) and the database folder is writable. |
+| Worker cannot connect | RabbitMQ must be running, and both `appsettings.json` files must use the same host, port, user, password, and virtual host. The worker retries every 5 seconds. |
+| `SQLite database is locked` | Close any `sqlite3` session holding `BEGIN EXCLUSIVE`. The worker retries transient SQLite busy/locked errors automatically. Do not run manual locks during normal use. |
+| Messages are not processed | Confirm the worker is running and its log says `Waiting for orders...`. Check the `orders` queue in the Management UI. If messages are in the DLQ, inspect them; the app does not replay them automatically. |
+| `dotnet: command not found` or `NETSDK1045` | Install the .NET 10 SDK from https://dotnet.microsoft.com/download/dotnet/10.0 and open a new terminal. Check with `dotnet --list-sdks`. |
+| RabbitMQ login fails | Use the defaults `orderdev` / `orderdev_password`, or your `RABBITMQ_USER` / `RABBITMQ_PASSWORD` values. If you changed them after the volume was created, either use the new credentials in both `appsettings.json` files or reset the volume with `docker compose down -v` (this deletes broker data). |
+| `GET /health` returns `200` but orders fail | `/health` is liveness only. Check RabbitMQ with `docker compose ps`. |
+| The API returns `503` | RabbitMQ did not confirm the publish. Start RabbitMQ and check the API log. The order row is rolled back. |
+| The worker says an order was not found | The API and worker are using different SQLite files. Set the same `Database__Path` for both processes, or remove the override and use the defaults. |
+
+## 14. Quick Start
+
+For experienced users. Run from the repository root.
+
+**Terminal 1 — RabbitMQ**
+
+```bash
+docker compose up -d --wait
+```
+
+**Terminal 2 — API**
+
+```bash
+dotnet restore
+dotnet build
+dotnet run --project OrderProducer.Api
+```
+
+**Terminal 3 — Worker**
+
+```bash
+dotnet run --project OrderConsumer.Worker
+```
+
+**Terminal 4 — send an order**
+
+```bash
+curl -i -X POST http://localhost:5000/orders \
+  -H 'Content-Type: application/json' \
+  -d '{"customerName":"Sopanha","totalAmount":50.00,"products":[{"name":"Keyboard","quantity":2,"unitPrice":20.00},{"name":"Mouse","quantity":1,"unitPrice":10.00}]}'
+```
+
+Then query it:
+
+```bash
+curl http://localhost:5000/orders/PASTE_ORDER_ID_HERE
+```
+
+Stop with `Ctrl+C` in Terminals 2 and 3, then:
+
+```bash
+docker compose down
+```
