@@ -17,7 +17,9 @@ public sealed class RabbitMqPublisher(RabbitMqSettings settings, ILogger<RabbitM
         PublishAsync(order, settings.QueueName, nameof(OrderCreated), order.OrderId, cancellationToken);
 
     public Task PublishStatusAsync(OrderStatusChanged status, CancellationToken cancellationToken) =>
-        PublishAsync(status, settings.StatusQueueName, nameof(OrderStatusChanged), status.OrderId,
+        // Status updates are not unique per order, so each publish needs its own message ID.
+        // OrderCreated can reuse the order ID because an order is created once.
+        PublishAsync(status, settings.StatusQueueName, nameof(OrderStatusChanged), Guid.NewGuid(),
             cancellationToken);
 
     private async Task PublishAsync<T>(T message, string routingKey, string messageType, Guid messageId,

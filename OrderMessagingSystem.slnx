@@ -1,6 +1,7 @@
 <Solution>
   <Project Path="OrderConsumer.Worker/OrderConsumer.Worker.csproj" />
   <Project Path="OrderMessagingSystem.Tests/OrderMessagingSystem.Tests.csproj" />
+  <Project Path="OrderPersistence/OrderPersistence.csproj" />
   <Project Path="OrderProducer.Api/OrderProducer.Api.csproj" />
   <Project Path="Shared.Contracts/Shared.Contracts.csproj" />
 </Solution>

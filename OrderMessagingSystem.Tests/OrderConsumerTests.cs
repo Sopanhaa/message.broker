@@ -1,8 +1,10 @@
+using System.Collections.Concurrent;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging.Abstractions;
 using OrderConsumer.Worker;
+using OrderPersistence;
 using RabbitMQ.Client;
 using Shared.Contracts.Events;
 using Shared.Contracts.Messaging;
@@ -181,36 +183,83 @@ public sealed class OrderConsumerTests
     }
 
     [Fact]
+    public async Task Duplicate_order_message_id_is_acknowledged_without_reprocessing()
+    {
+        var store = new InMemoryOrderStore();
+        var processor = new FakeProcessor();
+        var (channel, calls) = CreateChannel();
+        const string messageId = "order-message-1";
+        await store.MarkProcessedAsync(messageId, ValidOrder.OrderId, nameof(OrderCreated), CancellationToken.None);
+
+        await CreateHandler(processor, store).HandleAsync(channel, Serialize(ValidOrder), 42,
+            CancellationToken.None, messageId);
+
+        Assert.Empty(processor.Orders);
+        Assert.Equal(("ack", 42UL, false, false), Assert.Single(calls.Settlements));
+    }
+
+    [Fact]
+    public async Task Processed_order_message_id_is_recorded_for_deduplication()
+    {
+        var store = new InMemoryOrderStore();
+        var processor = new FakeProcessor();
+        var (channel, calls) = CreateChannel();
+        const string messageId = "order-message-2";
+
+        await CreateHandler(processor, store).HandleAsync(channel, Serialize(ValidOrder), 42,
+            CancellationToken.None, messageId);
+
+        Assert.Single(processor.Orders);
+        Assert.True(await store.IsProcessedAsync(messageId, CancellationToken.None));
+        Assert.Equal(("ack", 42UL, false, false), Assert.Single(calls.Settlements));
+    }
+
+    [Fact]
     public async Task Valid_status_update_is_acknowledged_and_stored()
     {
-        var store = new OrderStatusStore();
+        var store = new InMemoryOrderStore();
+        var orderId = Guid.NewGuid();
+        store.Seed(new OrderCreated(orderId, "Sopanha", 50m, DateTimeOffset.UtcNow));
         var processor = new OrderStatusProcessor(store, NullLogger<OrderStatusProcessor>.Instance);
         var (channel, calls) = CreateChannel();
-        var update = new OrderStatusChanged(Guid.NewGuid(), OrderStatus.Completed, DateTimeOffset.UtcNow,
-            " Delivered ");
+        var update = new OrderStatusChanged(orderId, OrderStatus.Completed, DateTimeOffset.UtcNow, " Delivered ");
 
         await CreateStatusHandler(processor).HandleAsync(channel, Serialize(update), 7, CancellationToken.None);
 
         Assert.Equal(("ack", 7UL, false, false), Assert.Single(calls.Settlements));
-        var state = Assert.IsType<OrderState>(store.Get(update.OrderId));
+        var state = Assert.IsType<OrderSnapshot>(await store.GetAsync(update.OrderId, CancellationToken.None));
         Assert.Equal(OrderStatus.Completed, state.Status);
-        Assert.Equal("Delivered", state.Detail);
+        Assert.Equal("Delivered", state.StatusDetail);
     }
 
     [Fact]
     public async Task Stale_and_duplicate_status_updates_are_ignored()
     {
-        var store = new OrderStatusStore();
+        var store = new InMemoryOrderStore();
         var orderId = Guid.NewGuid();
         var now = DateTimeOffset.UtcNow;
+        store.Seed(new OrderCreated(orderId, "Sopanha", 50m, now.AddMinutes(-1)));
         var completed = new OrderStatusChanged(orderId, OrderStatus.Completed, now);
 
-        Assert.NotNull(store.Apply(completed));
-        Assert.Null(store.Apply(completed));
-        Assert.Null(store.Apply(new OrderStatusChanged(orderId, OrderStatus.Processing, now.AddSeconds(-1))));
+        Assert.NotNull(await store.ApplyStatusAsync(completed, CancellationToken.None));
+        Assert.Null(await store.ApplyStatusAsync(completed, CancellationToken.None));
+        Assert.Null(await store.ApplyStatusAsync(
+            new OrderStatusChanged(orderId, OrderStatus.Processing, now.AddSeconds(-1)), CancellationToken.None));
 
-        var state = Assert.IsType<OrderState>(store.Get(orderId));
+        var state = Assert.IsType<OrderSnapshot>(await store.GetAsync(orderId, CancellationToken.None));
         Assert.Equal(OrderStatus.Completed, state.Status);
+    }
+
+    [Fact]
+    public async Task Status_update_for_an_unknown_order_is_ignored()
+    {
+        var store = new InMemoryOrderStore();
+
+        var state = await store.ApplyStatusAsync(
+            new OrderStatusChanged(Guid.NewGuid(), OrderStatus.Completed, DateTimeOffset.UtcNow),
+            CancellationToken.None);
+
+        Assert.Null(state);
     }
 
     [Theory]
@@ -285,15 +334,36 @@ public sealed class OrderConsumerTests
     }
 
     [Fact]
+    public async Task Duplicate_status_message_id_is_acknowledged_without_reprocessing()
+    {
+        var store = new InMemoryOrderStore();
+        var orderId = Guid.NewGuid();
+        store.Seed(new OrderCreated(orderId, "Sopanha", 50m, DateTimeOffset.UtcNow));
+        var processor = new FakeStatusProcessor();
+        var (channel, calls) = CreateChannel();
+        const string messageId = "status-message-1";
+        await store.MarkProcessedAsync(messageId, orderId, nameof(OrderStatusChanged), CancellationToken.None);
+
+        await CreateStatusHandler(processor, store).HandleAsync(channel,
+            Serialize(new OrderStatusChanged(orderId, OrderStatus.Completed, DateTimeOffset.UtcNow)),
+            7, CancellationToken.None, messageId);
+
+        Assert.Empty(processor.Updates);
+        Assert.Equal(("ack", 7UL, false, false), Assert.Single(calls.Settlements));
+    }
+
+    [Fact]
     public async Task Status_settlement_failure_propagates_for_reconnection_without_a_second_settlement()
     {
-        var store = new OrderStatusStore();
+        var store = new InMemoryOrderStore();
+        var orderId = Guid.NewGuid();
+        store.Seed(new OrderCreated(orderId, "Sopanha", 50m, DateTimeOffset.UtcNow));
         var processor = new OrderStatusProcessor(store, NullLogger<OrderStatusProcessor>.Instance);
         var (channel, calls) = CreateChannel();
         calls.Failure = new IOException("Channel closed during settlement");
 
         var error = await Assert.ThrowsAsync<IOException>(() => CreateStatusHandler(processor).HandleAsync(
-            channel, Serialize(new OrderStatusChanged(Guid.NewGuid(), OrderStatus.Completed, DateTimeOffset.UtcNow)),
+            channel, Serialize(new OrderStatusChanged(orderId, OrderStatus.Completed, DateTimeOffset.UtcNow)),
             7, CancellationToken.None));
 
         Assert.Same(calls.Failure, error);
@@ -303,11 +373,14 @@ public sealed class OrderConsumerTests
     private static byte[] Serialize<T>(T message) =>
         JsonSerializer.SerializeToUtf8Bytes(message, JsonSerializerOptions.Web);
 
-    private static OrderMessageHandler CreateHandler(IOrderProcessor processor) =>
-        new(processor, new RabbitMqSettings(), NullLogger<OrderMessageHandler>.Instance);
+    private static OrderMessageHandler CreateHandler(IOrderProcessor processor, IOrderStore? store = null) =>
+        new(processor, store ?? new InMemoryOrderStore(), new RabbitMqSettings(),
+            NullLogger<OrderMessageHandler>.Instance);
 
-    private static OrderStatusMessageHandler CreateStatusHandler(IOrderStatusProcessor processor) =>
-        new(processor, new RabbitMqSettings(), NullLogger<OrderStatusMessageHandler>.Instance);
+    private static OrderStatusMessageHandler CreateStatusHandler(IOrderStatusProcessor processor,
+        IOrderStore? store = null) =>
+        new(processor, store ?? new InMemoryOrderStore(), new RabbitMqSettings(),
+            NullLogger<OrderStatusMessageHandler>.Instance);
 
     private static (IChannel Channel, ChannelProxy Calls) CreateChannel()
     {
@@ -331,6 +404,59 @@ public sealed class OrderConsumerTests
             };
             Settlements.Add((operation, (ulong)args![0]!, (bool)args[1]!, operation == "nack" && (bool)args[2]!));
             return Failure is null ? ValueTask.CompletedTask : ValueTask.FromException(Failure);
+        }
+    }
+
+    private sealed class InMemoryOrderStore : IOrderStore
+    {
+        private readonly ConcurrentDictionary<Guid, OrderSnapshot> _orders = new();
+        private readonly ConcurrentDictionary<string, byte> _processedMessages = new();
+
+        public void Seed(OrderCreated order) => _orders[order.OrderId] = new OrderSnapshot(
+            order.OrderId, order.CustomerName, order.TotalAmount, order.CreatedAtUtc,
+            order.Products ?? [], OrderStatus.Received, null, order.CreatedAtUtc);
+
+        public Task<OrderSnapshot?> GetAsync(Guid orderId, CancellationToken cancellationToken) =>
+            Task.FromResult(_orders.TryGetValue(orderId, out var state) ? state : null);
+
+        public Task<bool> TryCreateAsync(OrderCreated order, CancellationToken cancellationToken)
+        {
+            Seed(order);
+            return Task.FromResult(true);
+        }
+
+        public Task<OrderSnapshot?> ApplyStatusAsync(OrderStatusChanged update,
+            CancellationToken cancellationToken)
+        {
+            while (true)
+            {
+                if (!_orders.TryGetValue(update.OrderId, out var current))
+                    return Task.FromResult<OrderSnapshot?>(null);
+                if (current.StatusUpdatedAtUtc >= update.UpdatedAtUtc)
+                    return Task.FromResult<OrderSnapshot?>(null);
+
+                var next = current with
+                {
+                    Status = update.Status,
+                    StatusDetail = string.IsNullOrWhiteSpace(update.Detail) ? null : update.Detail.Trim(),
+                    StatusUpdatedAtUtc = update.UpdatedAtUtc
+                };
+                if (_orders.TryUpdate(update.OrderId, next, current))
+                    return Task.FromResult<OrderSnapshot?>(next);
+            }
+        }
+
+        public Task<bool> TryDeleteAsync(Guid orderId, CancellationToken cancellationToken) =>
+            Task.FromResult(_orders.TryRemove(orderId, out _));
+
+        public Task<bool> IsProcessedAsync(string messageId, CancellationToken cancellationToken) =>
+            Task.FromResult(_processedMessages.ContainsKey(messageId));
+
+        public Task MarkProcessedAsync(string messageId, Guid orderId, string messageType,
+            CancellationToken cancellationToken)
+        {
+            _processedMessages.TryAdd(messageId, 0);
+            return Task.CompletedTask;
         }
     }
 

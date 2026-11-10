@@ -4,8 +4,10 @@ using System.Text;
 using System.Text.Json;
 using Microsoft.AspNetCore.Hosting;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using OrderPersistence;
 using OrderProducer.Api.Services;
 using Shared.Contracts.Events;
 
@@ -151,7 +153,7 @@ public sealed class OrdersApiTests
     {
         await using var app = new ApiFactory();
         using var client = app.CreateClient();
-        var orderId = Guid.NewGuid();
+        var orderId = await CreateOrderAsync(client);
         using var response = await client.PatchAsJsonAsync($"/orders/{orderId}/status",
             new { status = "Completed", detail = " Delivered " });
 
@@ -208,21 +210,121 @@ public sealed class OrdersApiTests
     public async Task Status_publish_failure_returns_service_unavailable()
     {
         await using var app = new ApiFactory();
-        app.Publisher.OnPublishStatus = _ => throw new MessagePublishException("Not confirmed", new IOException("broker down"));
         using var client = app.CreateClient();
-        using var response = await client.PatchAsJsonAsync($"/orders/{Guid.NewGuid()}/status",
+        var orderId = await CreateOrderAsync(client);
+        app.Publisher.OnPublishStatus = _ => throw new MessagePublishException("Not confirmed", new IOException("broker down"));
+        using var response = await client.PatchAsJsonAsync($"/orders/{orderId}/status",
             new { status = "Failed" });
 
         Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
     }
 
+    [Fact]
+    public async Task Get_order_returns_persisted_state()
+    {
+        await using var app = new ApiFactory();
+        using var client = app.CreateClient();
+        var orderId = await CreateOrderAsync(client);
+
+        using var response = await client.GetAsync($"/orders/{orderId}");
+
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal(orderId, body.GetProperty("orderId").GetGuid());
+        Assert.Equal("Sopanha", body.GetProperty("customerName").GetString());
+        Assert.Equal(50m, body.GetProperty("totalAmount").GetDecimal());
+        Assert.Equal("Received", body.GetProperty("status").GetString());
+        Assert.Empty(body.GetProperty("products").EnumerateArray());
+    }
+
+    [Fact]
+    public async Task Get_order_returns_persisted_products()
+    {
+        await using var app = new ApiFactory();
+        using var client = app.CreateClient();
+        using var created = await client.PostAsJsonAsync("/orders", new
+        {
+            customerName = "Sopanha",
+            totalAmount = 50m,
+            products = new[] { new OrderProduct("Keyboard", 2, 20m), new OrderProduct("Mouse", 1, 10m) }
+        });
+        var orderId = (await created.Content.ReadFromJsonAsync<JsonElement>())
+            .GetProperty("orderId").GetGuid();
+
+        using var response = await client.GetAsync($"/orders/{orderId}");
+
+        var products = (await response.Content.ReadFromJsonAsync<JsonElement>())
+            .GetProperty("products").EnumerateArray().ToArray();
+        Assert.Equal(2, products.Length);
+        Assert.Equal("Keyboard", products[0].GetProperty("name").GetString());
+        Assert.Equal(2, products[0].GetProperty("quantity").GetInt32());
+        Assert.Equal(20m, products[0].GetProperty("unitPrice").GetDecimal());
+    }
+
+    [Fact]
+    public async Task Get_unknown_order_returns_not_found()
+    {
+        await using var app = new ApiFactory();
+        using var client = app.CreateClient();
+
+        using var response = await client.GetAsync($"/orders/{Guid.NewGuid()}");
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Status_update_for_unknown_order_returns_not_found_without_publishing()
+    {
+        await using var app = new ApiFactory();
+        using var client = app.CreateClient();
+
+        using var response = await client.PatchAsJsonAsync($"/orders/{Guid.NewGuid()}/status",
+            new { status = "Completed" });
+
+        Assert.Equal(HttpStatusCode.NotFound, response.StatusCode);
+        Assert.Empty(app.Publisher.Statuses);
+    }
+
+    [Fact]
+    public async Task Publish_failure_removes_the_persisted_order()
+    {
+        await using var app = new ApiFactory();
+        app.Publisher.OnPublish = _ => throw new MessagePublishException("Not confirmed", new IOException("broker down"));
+        using var client = app.CreateClient();
+
+        using var response = await client.PostAsJsonAsync("/orders", new { customerName = "Sopanha", totalAmount = 50m });
+
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+        var attempted = Assert.Single(app.Publisher.Orders);
+        using var get = await client.GetAsync($"/orders/{attempted.OrderId}");
+        Assert.Equal(HttpStatusCode.NotFound, get.StatusCode);
+    }
+
+    private static async Task<Guid> CreateOrderAsync(HttpClient client)
+    {
+        using var response = await client.PostAsJsonAsync("/orders", new { customerName = "Sopanha", totalAmount = 50m });
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>();
+        return body.GetProperty("orderId").GetGuid();
+    }
+
     private sealed class ApiFactory : WebApplicationFactory<Program>
     {
+        // Each factory gets its own database so tests do not see each other's orders.
+        private readonly string _databasePath =
+            Path.Combine(Path.GetTempPath(), $"order-messaging-tests-{Guid.NewGuid():N}.db");
+
         public FakePublisher Publisher { get; } = new();
+
         protected override void ConfigureWebHost(IWebHostBuilder builder) => builder.ConfigureServices(services =>
         {
             services.RemoveAll<IMessagePublisher>();
             services.AddSingleton<IMessagePublisher>(Publisher);
+
+            services.RemoveAll<IDbContextFactory<OrderDbContext>>();
+            services.RemoveAll<DbContextOptions<OrderDbContext>>();
+            services.AddDbContextFactory<OrderDbContext>(options =>
+                options.UseSqlite($"Data Source={_databasePath};Default Timeout=5"));
         });
     }
 
@@ -235,14 +337,14 @@ public sealed class OrdersApiTests
 
         public async Task PublishAsync(OrderCreated order, CancellationToken cancellationToken)
         {
-            if (OnPublish is not null) await OnPublish(cancellationToken);
             Orders.Add(order);
+            if (OnPublish is not null) await OnPublish(cancellationToken);
         }
 
         public async Task PublishStatusAsync(OrderStatusChanged status, CancellationToken cancellationToken)
         {
-            if (OnPublishStatus is not null) await OnPublishStatus(cancellationToken);
             Statuses.Add(status);
+            if (OnPublishStatus is not null) await OnPublishStatus(cancellationToken);
         }
     }
 }

@@ -1,17 +1,17 @@
+using OrderPersistence;
 using Shared.Contracts.Events;
 
 namespace OrderConsumer.Worker;
 
-public sealed class OrderProcessor(IOrderStatusStore statusStore, ILogger<OrderProcessor> logger)
-    : IOrderProcessor
+public sealed class OrderProcessor(IOrderStore store, ILogger<OrderProcessor> logger) : IOrderProcessor
 {
     public async Task ProcessAsync(OrderCreated order, CancellationToken cancellationToken)
     {
         logger.LogInformation("Processing order {OrderId}: customer={CustomerName}, total={TotalAmount}",
             order.OrderId, order.CustomerName, order.TotalAmount);
 
-        statusStore.Apply(new OrderStatusChanged(order.OrderId, OrderStatus.Processing,
-            DateTimeOffset.UtcNow, "Order accepted for processing"));
+        await ApplyAsync(new OrderStatusChanged(order.OrderId, OrderStatus.Processing,
+            DateTimeOffset.UtcNow, "Order accepted for processing"), cancellationToken);
 
         foreach (var product in order.Products ?? [])
             logger.LogInformation("Order product: name={ProductName}, quantity={Quantity}, unitPrice={UnitPrice}",
@@ -21,7 +21,15 @@ public sealed class OrderProcessor(IOrderStatusStore statusStore, ILogger<OrderP
         // Real operations must tolerate redelivery of the same OrderId.
         await Task.Delay(TimeSpan.FromSeconds(1), cancellationToken);
 
-        statusStore.Apply(new OrderStatusChanged(order.OrderId, OrderStatus.Completed, DateTimeOffset.UtcNow));
+        await ApplyAsync(new OrderStatusChanged(order.OrderId, OrderStatus.Completed, DateTimeOffset.UtcNow),
+            cancellationToken);
         logger.LogInformation("Completed order {OrderId}", order.OrderId);
+    }
+
+    private async Task ApplyAsync(OrderStatusChanged update, CancellationToken cancellationToken)
+    {
+        if (await store.ApplyStatusAsync(update, cancellationToken) is null)
+            logger.LogWarning("Order {OrderId} was not found; status {Status} was not recorded",
+                update.OrderId, update.Status);
     }
 }

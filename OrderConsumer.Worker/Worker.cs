@@ -66,7 +66,7 @@ public sealed class Worker(
                 cancellationToken: stoppingToken);
 
             AsyncEventingBasicConsumer CreateConsumer(string queueName,
-                Func<IChannel, ReadOnlyMemory<byte>, ulong, CancellationToken, Task> handle)
+                Func<IChannel, ReadOnlyMemory<byte>, string?, ulong, CancellationToken, Task> handle)
             {
                 var consumer = new AsyncEventingBasicConsumer(channel);
                 consumer.UnregisteredAsync += (_, _) =>
@@ -80,7 +80,8 @@ public sealed class Worker(
                 {
                     try
                     {
-                        await handle(channel, message.Body, message.DeliveryTag, session.Token);
+                        await handle(channel, message.Body, message.BasicProperties.MessageId,
+                            message.DeliveryTag, session.Token);
                     }
                     catch (OperationCanceledException) when (session.IsCancellationRequested) { }
                     catch (Exception ex)
@@ -94,8 +95,12 @@ public sealed class Worker(
                 return consumer;
             }
 
-            var orderConsumer = CreateConsumer(settings.QueueName, orderHandler.HandleAsync);
-            var statusConsumer = CreateConsumer(settings.StatusQueueName, statusHandler.HandleAsync);
+            var orderConsumer = CreateConsumer(settings.QueueName,
+                (channel, body, messageId, deliveryTag, token) =>
+                    orderHandler.HandleAsync(channel, body, deliveryTag, token, messageId));
+            var statusConsumer = CreateConsumer(settings.StatusQueueName,
+                (channel, body, messageId, deliveryTag, token) =>
+                    statusHandler.HandleAsync(channel, body, deliveryTag, token, messageId));
 
             await channel.BasicConsumeAsync(settings.QueueName, autoAck: false, consumer: orderConsumer,
                 cancellationToken: stoppingToken);
