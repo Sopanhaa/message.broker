@@ -8,10 +8,11 @@ namespace OrderConsumer.Worker;
 
 public sealed class OrderMessageHandler(
     IOrderProcessor processor, IOrderStore store, RabbitMqSettings settings,
-    ILogger<OrderMessageHandler> logger)
+    ILogger<OrderMessageHandler> logger, RetryScheduler retryScheduler)
 {
     public async Task HandleAsync(IChannel channel, ReadOnlyMemory<byte> body, ulong deliveryTag,
-        CancellationToken cancellationToken, string? messageId = null)
+        CancellationToken cancellationToken, string? messageId = null,
+        IReadOnlyBasicProperties? properties = null, IRetryPublisher? retryPublisher = null)
     {
         OrderCreated order;
         try
@@ -34,7 +35,8 @@ public sealed class OrderMessageHandler(
         {
             if (cancellationToken.IsCancellationRequested) return;
 
-            logger.LogError(ex, "Delivery {DeliveryTag} failed; rejecting to {DeadLetterQueue}",
+            // Invalid JSON or schema is permanent: retrying cannot fix the payload.
+            logger.LogError(ex, "Delivery {DeliveryTag} has an invalid payload; rejecting to {DeadLetterQueue}",
                 deliveryTag, settings.DeadLetterQueue);
             await channel.BasicNackAsync(deliveryTag, multiple: false, requeue: false,
                 cancellationToken: cancellationToken);
@@ -42,8 +44,41 @@ public sealed class OrderMessageHandler(
         }
 
         // A redelivery after a lost ACK is expected. Skip work already completed for this message.
-        // This check is outside the processing try so a failed ACK reconnects instead of NACKing twice.
-        if (messageId is not null && await store.IsProcessedAsync(messageId, cancellationToken))
+        // Settlement is outside the try so a failed ACK reconnects instead of NACKing twice.
+        bool alreadyProcessed;
+        try
+        {
+            alreadyProcessed = messageId is not null &&
+                await store.IsProcessedAsync(messageId, cancellationToken);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return;
+        }
+        catch (Exception ex) when (ProcessingFailureClassifier.IsTransient(ex))
+        {
+            if (cancellationToken.IsCancellationRequested) return;
+
+            await ScheduleRetryAsync(channel, body, deliveryTag, messageId, properties, retryPublisher,
+                ex, cancellationToken);
+            return;
+        }
+        catch (Exception ex)
+        {
+            if (cancellationToken.IsCancellationRequested) return;
+
+            // The deduplication check could not be completed. Treat an unexpected
+            // failure like any other non-recoverable failure and keep it in the DLQ
+            // rather than silently discarding it.
+            logger.LogError(ex,
+                "Deduplication check for delivery {DeliveryTag} failed; rejecting to {DeadLetterQueue}",
+                deliveryTag, settings.DeadLetterQueue);
+            await channel.BasicNackAsync(deliveryTag, multiple: false, requeue: false,
+                cancellationToken: cancellationToken);
+            return;
+        }
+
+        if (alreadyProcessed)
         {
             await channel.BasicAckAsync(deliveryTag, multiple: false, cancellationToken: cancellationToken);
             logger.LogInformation("Skipped duplicate OrderCreated {MessageId} for order {OrderId}",
@@ -66,11 +101,22 @@ public sealed class OrderMessageHandler(
         {
             return;
         }
+        catch (Exception ex) when (ProcessingFailureClassifier.IsTransient(ex))
+        {
+            if (cancellationToken.IsCancellationRequested) return;
+
+            // Do not mark the message processed: the retry must do the work again.
+            await ScheduleRetryAsync(channel, body, deliveryTag, messageId, properties, retryPublisher,
+                ex, cancellationToken);
+            return;
+        }
         catch (Exception ex)
         {
             if (cancellationToken.IsCancellationRequested) return;
 
-            logger.LogError(ex, "Delivery {DeliveryTag} failed; rejecting to {DeadLetterQueue}",
+            // Unexpected failures use the bounded DLQ policy: log once and retain
+            // the message for inspection instead of retrying forever.
+            logger.LogError(ex, "Delivery {DeliveryTag} failed permanently; rejecting to {DeadLetterQueue}",
                 deliveryTag, settings.DeadLetterQueue);
             await channel.BasicNackAsync(deliveryTag, multiple: false, requeue: false,
                 cancellationToken: cancellationToken);
@@ -82,4 +128,11 @@ public sealed class OrderMessageHandler(
         await channel.BasicAckAsync(deliveryTag, multiple: false, cancellationToken: cancellationToken);
         logger.LogInformation("Processed and acknowledged order {OrderId}", order.OrderId);
     }
+
+    private Task ScheduleRetryAsync(IChannel channel, ReadOnlyMemory<byte> body, ulong deliveryTag,
+        string? messageId, IReadOnlyBasicProperties? properties, IRetryPublisher? retryPublisher,
+        Exception exception, CancellationToken cancellationToken) =>
+        retryScheduler.HandleTransientFailureAsync(channel, deliveryTag, body, messageId,
+            nameof(OrderCreated), properties, settings.RetryQueues, settings.DeadLetterQueue,
+            retryPublisher, exception, cancellationToken);
 }

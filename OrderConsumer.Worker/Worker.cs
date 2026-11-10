@@ -6,7 +6,7 @@ namespace OrderConsumer.Worker;
 
 public sealed class Worker(
     RabbitMqSettings settings, OrderMessageHandler orderHandler, OrderStatusMessageHandler statusHandler,
-    ILogger<Worker> logger) : BackgroundService
+    ILogger<Worker> logger, ILogger<RabbitMqRetryPublisher> retryLogger) : BackgroundService
 {
     private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(5);
 
@@ -45,7 +45,15 @@ public sealed class Worker(
     {
         using var session = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
         await using var connection = await settings.CreateConnectionFactory().CreateConnectionAsync(stoppingToken);
-        await using var channel = await connection.CreateChannelAsync(cancellationToken: stoppingToken);
+
+        // Each consumer owns its channel, and the retry publisher owns a separate
+        // confirm-enabled channel. No channel is shared by concurrent operations.
+        await using var orderChannel = await connection.CreateChannelAsync(cancellationToken: stoppingToken);
+        await using var statusChannel = await connection.CreateChannelAsync(cancellationToken: stoppingToken);
+        await using var retryChannel = await connection.CreateChannelAsync(new CreateChannelOptions(
+            publisherConfirmationsEnabled: true,
+            publisherConfirmationTrackingEnabled: true), stoppingToken);
+        var retryPublisher = new RabbitMqRetryPublisher(retryChannel, retryLogger);
         var disconnected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         Task OnShutdownAsync(object sender, ShutdownEventArgs reason)
@@ -57,18 +65,23 @@ public sealed class Worker(
         }
 
         connection.ConnectionShutdownAsync += OnShutdownAsync;
-        channel.ChannelShutdownAsync += OnShutdownAsync;
+        orderChannel.ChannelShutdownAsync += OnShutdownAsync;
+        statusChannel.ChannelShutdownAsync += OnShutdownAsync;
+        retryChannel.ChannelShutdownAsync += OnShutdownAsync;
 
         try
         {
-            await RabbitMqTopology.DeclareAsync(channel, settings, stoppingToken);
-            await channel.BasicQosAsync(prefetchSize: 0, prefetchCount: 1, global: false,
+            await RabbitMqTopology.DeclareAsync(orderChannel, settings, stoppingToken);
+            await orderChannel.BasicQosAsync(prefetchSize: 0, prefetchCount: 1, global: false,
+                cancellationToken: stoppingToken);
+            await statusChannel.BasicQosAsync(prefetchSize: 0, prefetchCount: 1, global: false,
                 cancellationToken: stoppingToken);
 
-            AsyncEventingBasicConsumer CreateConsumer(string queueName,
-                Func<IChannel, ReadOnlyMemory<byte>, string?, ulong, CancellationToken, Task> handle)
+            AsyncEventingBasicConsumer CreateConsumer(IChannel consumerChannel, string queueName,
+                Func<IChannel, ReadOnlyMemory<byte>, IReadOnlyBasicProperties?, string?, ulong, CancellationToken,
+                    Task> handle)
             {
-                var consumer = new AsyncEventingBasicConsumer(channel);
+                var consumer = new AsyncEventingBasicConsumer(consumerChannel);
                 consumer.UnregisteredAsync += (_, _) =>
                 {
                     if (!stoppingToken.IsCancellationRequested)
@@ -80,8 +93,8 @@ public sealed class Worker(
                 {
                     try
                     {
-                        await handle(channel, message.Body, message.BasicProperties.MessageId,
-                            message.DeliveryTag, session.Token);
+                        await handle(consumerChannel, message.Body, message.BasicProperties,
+                            message.BasicProperties.MessageId, message.DeliveryTag, session.Token);
                     }
                     catch (OperationCanceledException) when (session.IsCancellationRequested) { }
                     catch (Exception ex)
@@ -95,16 +108,18 @@ public sealed class Worker(
                 return consumer;
             }
 
-            var orderConsumer = CreateConsumer(settings.QueueName,
-                (channel, body, messageId, deliveryTag, token) =>
-                    orderHandler.HandleAsync(channel, body, deliveryTag, token, messageId));
-            var statusConsumer = CreateConsumer(settings.StatusQueueName,
-                (channel, body, messageId, deliveryTag, token) =>
-                    statusHandler.HandleAsync(channel, body, deliveryTag, token, messageId));
+            var orderConsumer = CreateConsumer(orderChannel, settings.QueueName,
+                (channel, body, properties, messageId, deliveryTag, token) =>
+                    orderHandler.HandleAsync(channel, body, deliveryTag, token, messageId, properties,
+                        retryPublisher));
+            var statusConsumer = CreateConsumer(statusChannel, settings.StatusQueueName,
+                (channel, body, properties, messageId, deliveryTag, token) =>
+                    statusHandler.HandleAsync(channel, body, deliveryTag, token, messageId, properties,
+                        retryPublisher));
 
-            await channel.BasicConsumeAsync(settings.QueueName, autoAck: false, consumer: orderConsumer,
+            await orderChannel.BasicConsumeAsync(settings.QueueName, autoAck: false, consumer: orderConsumer,
                 cancellationToken: stoppingToken);
-            await channel.BasicConsumeAsync(settings.StatusQueueName, autoAck: false, consumer: statusConsumer,
+            await statusChannel.BasicConsumeAsync(settings.StatusQueueName, autoAck: false, consumer: statusConsumer,
                 cancellationToken: stoppingToken);
             logger.LogInformation(
                 "Waiting for orders in {Queue} and status updates in {StatusQueue}; prefetch=1 per queue, manual acknowledgments enabled",
@@ -113,10 +128,12 @@ public sealed class Worker(
         }
         finally
         {
-            // Stop in-flight work before disposing the channel and requeuing unfinished deliveries.
+            // Stop in-flight work before disposing the channels and requeuing unfinished deliveries.
             await session.CancelAsync();
             connection.ConnectionShutdownAsync -= OnShutdownAsync;
-            channel.ChannelShutdownAsync -= OnShutdownAsync;
+            orderChannel.ChannelShutdownAsync -= OnShutdownAsync;
+            statusChannel.ChannelShutdownAsync -= OnShutdownAsync;
+            retryChannel.ChannelShutdownAsync -= OnShutdownAsync;
         }
     }
 }

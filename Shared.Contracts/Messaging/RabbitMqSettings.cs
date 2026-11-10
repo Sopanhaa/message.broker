@@ -15,10 +15,18 @@ public sealed class RabbitMqSettings
     public string DeadLetterExchange => $"{QueueName}.dlx";
     public string DeadLetterQueue => $"{QueueName}.dead-letter";
 
+    // Retry queues expire into the existing dead-letter exchange. A dedicated
+    // routing key binds the main queue to that exchange so an expiring retry
+    // returns to the original processing queue instead of the DLQ.
+    public string RetryReturnRoutingKey => $"{QueueName}.retry.return";
+    public IReadOnlyList<RetryQueue> RetryQueues => RetrySchedule.ForQueue(QueueName);
+
     // Status updates travel on their own queue so a slow order process cannot delay them.
     public string StatusQueueName => $"{QueueName}.status";
     public string StatusDeadLetterExchange => $"{StatusQueueName}.dlx";
     public string StatusDeadLetterQueue => $"{StatusQueueName}.dead-letter";
+    public string StatusRetryReturnRoutingKey => $"{StatusQueueName}.retry.return";
+    public IReadOnlyList<RetryQueue> StatusRetryQueues => RetrySchedule.ForQueue(StatusQueueName);
 
     public void Validate()
     {
