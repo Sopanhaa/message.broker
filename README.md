@@ -1,4 +1,4 @@
-# Order Messaging System
+# Order Messaging 
 
 A practical demo of asynchronous messaging with ASP.NET Core, a background worker, RabbitMQ, and SQLite.
 
@@ -73,7 +73,7 @@ ls
 
 You should see `OrderMessagingSystem.slnx`, `docker-compose.yml`, `README.md`, and the project folders.
 
-## 4. Configure the Project
+## 4. Configure Project
 
 The default configuration works on a local computer. You do not need to edit any file for the first run.
 
@@ -219,7 +219,7 @@ Build succeeded.
     0 Error(s)
 ```
 
-### If the SDK is missing
+### If SDK is missing
 
 If you see `dotnet: command not found`, install the .NET 10 SDK from https://dotnet.microsoft.com/download/dotnet/10.0 and open a new terminal.
 
@@ -231,7 +231,7 @@ dotnet --list-sdks
 
 Install a **10.x** SDK and try again.
 
-## 7. Run the API
+## 7. Run API
 
 Open a terminal in the repository root. This is **Terminal 2** if you started RabbitMQ in Terminal 1.
 
@@ -264,7 +264,7 @@ Leave this terminal running. Stop the API with `Ctrl+C`.
 
 > The API connects to RabbitMQ lazily, on the first publish. It can start while RabbitMQ is down, but `POST /orders` will return `503`.
 
-## 8. Run the Worker
+## 8. Run Worker
 
 Open another terminal (**Terminal 3**) in the repository root. The API must keep running.
 
@@ -284,9 +284,9 @@ If RabbitMQ is not ready, the worker logs `Consumer connection failed` and retri
 
 Leave this terminal running. Stop the worker with `Ctrl+C`.
 
-## 9. Test the Project Step by Step
+## 9. Test Project 
 
-### Step 1 — Check RabbitMQ
+### Step 1 Check RabbitMQ
 
 ```bash
 docker compose ps
@@ -294,7 +294,7 @@ docker compose ps
 
 The `rabbitmq` service must be `healthy`.
 
-### Step 2 — Start the API
+### Step 2 Start the API
 
 In **Terminal 2**:
 
@@ -304,7 +304,7 @@ dotnet run --project OrderProducer.Api
 
 Wait for `Now listening on: http://localhost:5000`.
 
-### Step 3 — Start the Worker
+### Step 3 Start the Worker
 
 In **Terminal 3**:
 
@@ -314,13 +314,13 @@ dotnet run --project OrderConsumer.Worker
 
 Wait for `Waiting for orders in orders and status updates in orders.status`.
 
-### Step 4 — Open a request terminal
+### Step 4 Open a request terminal
 
 Use **Postman** or open **Terminal 4**. The examples below use `curl`.
 
 > On Windows PowerShell, `curl` is an alias for `Invoke-WebRequest`. Use `curl.exe` or Postman instead.
 
-### Step 5 — Send an order
+### Step 5 Send an order
 
 ```bash
 curl -i -X POST http://localhost:5000/orders \
@@ -335,7 +335,7 @@ If you use Postman:
 - Header: `Content-Type: application/json`
 - Body → raw → JSON: the JSON shown above.
 
-### Step 6 — Check the API response
+### Step 6 Check the API response
 
 A successful request returns `HTTP/1.1 202 Accepted` and a body like this:
 
@@ -351,7 +351,7 @@ A successful request returns `HTTP/1.1 202 Accepted` and a body like this:
 
 If you get `400 Bad Request`, check that `totalAmount` equals the sum of `quantity * unitPrice` for all products. If you get `503 Service Unavailable`, RabbitMQ is not reachable.
 
-### Step 7 — Watch the worker
+### Step 7 Watch the worker
 
 Switch to **Terminal 3**. Within a second or two you should see:
 
@@ -365,7 +365,7 @@ Processed and acknowledged order <your-order-id>
 
 **This is example output.** The order ID and timestamps will differ. You may also see EF Core SQL command logs; they are normal.
 
-### Step 8 — Check RabbitMQ
+### Step 8 Check RabbitMQ
 
 1. Open **http://localhost:15673**.
 2. Sign in with `orderdev` / `orderdev_password`.
@@ -384,7 +384,7 @@ You should see:
 
 An empty `orders` queue is normal: the worker may have already processed the message. Retry queues have no consumers and drain themselves when their TTL expires.
 
-### Step 9 — Check the saved order
+### Step 9 Check the saved order
 
 Use the `orderId` from Step 6:
 
@@ -410,7 +410,7 @@ Expected structure:
 }
 ```
 
-**This is example output.** Right after creation, the status may still be `Received` or `Processing`. Wait one or two seconds and request it again; it should become `Completed`.
+**Example output.** Right after creation, the status may still be `Received` or `Processing`. Wait one or two seconds and request it again; it should become `Completed`.
 
 #### Optional: update the status
 
@@ -645,13 +645,13 @@ Prefer `docker compose stop` if you only want to pause RabbitMQ but keep the con
 
 For experienced users. Run from the repository root.
 
-**Terminal 1 — RabbitMQ**
+**Terminal 1 RabbitMQ**
 
 ```bash
 docker compose up -d --wait
 ```
 
-**Terminal 2 — API**
+**Terminal 2 API**
 
 ```bash
 dotnet restore
@@ -659,13 +659,13 @@ dotnet build
 dotnet run --project OrderProducer.Api
 ```
 
-**Terminal 3 — Worker**
+**Terminal 3 Worker**
 
 ```bash
 dotnet run --project OrderConsumer.Worker
 ```
 
-**Terminal 4 — send an order**
+**Terminal 4 send an order**
 
 ```bash
 curl -i -X POST http://localhost:5000/orders \
