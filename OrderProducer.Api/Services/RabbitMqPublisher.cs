@@ -14,16 +14,26 @@ public sealed class RabbitMqPublisher(RabbitMqSettings settings, ILogger<RabbitM
     private IChannel? _channel;
 
     public Task PublishAsync(OrderCreated order, CancellationToken cancellationToken) =>
-        PublishAsync(order, settings.QueueName, nameof(OrderCreated), order.OrderId, cancellationToken);
+        PublishToExchangeAsync(order, exchange: "", routingKey: settings.QueueName,
+            nameof(OrderCreated), order.OrderId, cancellationToken);
 
     public Task PublishStatusAsync(OrderStatusChanged status, CancellationToken cancellationToken) =>
         // Status updates are not unique per order, so each publish needs its own message ID.
         // OrderCreated can reuse the order ID because an order is created once.
-        PublishAsync(status, settings.StatusQueueName, nameof(OrderStatusChanged), Guid.NewGuid(),
-            cancellationToken);
+        PublishToExchangeAsync(status, exchange: "", routingKey: settings.StatusQueueName,
+            nameof(OrderStatusChanged), Guid.NewGuid(), cancellationToken);
 
-    private async Task PublishAsync<T>(T message, string routingKey, string messageType, Guid messageId,
-        CancellationToken cancellationToken)
+    public Task PublishFanoutAsync(OrderRoutingEvent routingEvent, CancellationToken cancellationToken) =>
+        PublishToExchangeAsync(routingEvent, RoutingTopology.FanoutExchangeName(settings), routingKey: "",
+            nameof(OrderRoutingEvent), routingEvent.EventId, cancellationToken);
+
+    public Task PublishTopicAsync(OrderRoutingEvent routingEvent, string routingKey,
+        CancellationToken cancellationToken) =>
+        PublishToExchangeAsync(routingEvent, RoutingTopology.TopicExchangeName(settings), routingKey,
+            nameof(OrderRoutingEvent), routingEvent.EventId, cancellationToken);
+
+    private async Task PublishToExchangeAsync<T>(T message, string exchange, string routingKey,
+        string messageType, Guid messageId, CancellationToken cancellationToken)
     {
         var body = JsonSerializer.SerializeToUtf8Bytes(message, JsonSerializerOptions.Web);
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
@@ -41,6 +51,7 @@ public sealed class RabbitMqPublisher(RabbitMqSettings settings, ILogger<RabbitM
                     publisherConfirmationsEnabled: true,
                     publisherConfirmationTrackingEnabled: true), timeout.Token);
                 await RabbitMqTopology.DeclareAsync(_channel, settings, timeout.Token);
+                await RoutingTopology.DeclareAsync(_channel, settings, timeout.Token);
                 logger.LogInformation("Publisher connected to RabbitMQ at {Host}:{Port}", settings.HostName, settings.Port);
             }
 
@@ -53,9 +64,10 @@ public sealed class RabbitMqPublisher(RabbitMqSettings settings, ILogger<RabbitM
             };
             // With confirmation tracking enabled, this await includes the broker confirmation.
             // mandatory=true also reports an unroutable message as a publishing failure.
-            await _channel!.BasicPublishAsync(exchange: "", routingKey: routingKey,
+            await _channel!.BasicPublishAsync(exchange: exchange, routingKey: routingKey,
                 mandatory: true, basicProperties: properties, body: body, cancellationToken: timeout.Token);
-            logger.LogInformation("Broker confirmed {MessageType} {MessageId}", messageType, messageId);
+            logger.LogInformation("Broker confirmed {MessageType} {MessageId} on {Exchange}/{RoutingKey}",
+                messageType, messageId, string.IsNullOrEmpty(exchange) ? "(default)" : exchange, routingKey);
         }
         catch (Exception ex)
         {

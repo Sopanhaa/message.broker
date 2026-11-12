@@ -300,6 +300,112 @@ public sealed class OrdersApiTests
         Assert.Equal(HttpStatusCode.NotFound, get.StatusCode);
     }
 
+    [Fact]
+    public async Task Fanout_endpoint_publishes_event_and_returns_accepted()
+    {
+        await using var app = new ApiFactory();
+        using var client = app.CreateClient();
+
+        using var response = await client.PostAsync("/routing/fanout", content: null);
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        var routingEvent = Assert.Single(app.Publisher.FanoutEvents);
+        Assert.NotEqual(Guid.Empty, routingEvent.EventId);
+        Assert.Equal(OrderRoutingEventTypes.Created, routingEvent.EventType);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal(routingEvent.EventId, body.GetProperty("eventId").GetGuid());
+        Assert.Equal("orders.fanout", body.GetProperty("exchange").GetString());
+    }
+
+    [Fact]
+    public async Task Topic_endpoint_trims_routing_key_and_publishes_event()
+    {
+        await using var app = new ApiFactory();
+        using var client = app.CreateClient();
+
+        using var response = await client.PostAsJsonAsync("/routing/topic",
+            new { routingKey = " order.updated ", eventType = " OrderUpdated " });
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        var published = Assert.Single(app.Publisher.TopicEvents);
+        Assert.Equal("order.updated", published.RoutingKey);
+        Assert.Equal(OrderRoutingEventTypes.Updated, published.Event.EventType);
+        var body = await response.Content.ReadFromJsonAsync<JsonElement>();
+        Assert.Equal("order.updated", body.GetProperty("routingKey").GetString());
+        Assert.Equal("orders.topic", body.GetProperty("exchange").GetString());
+    }
+
+    [Fact]
+    public async Task Topic_endpoint_defaults_to_order_created_event_type()
+    {
+        await using var app = new ApiFactory();
+        using var client = app.CreateClient();
+
+        using var response = await client.PostAsJsonAsync("/routing/topic", new { routingKey = "order.created" });
+
+        Assert.Equal(HttpStatusCode.Accepted, response.StatusCode);
+        var published = Assert.Single(app.Publisher.TopicEvents);
+        Assert.Equal(OrderRoutingEventTypes.Created, published.Event.EventType);
+    }
+
+    [Theory]
+    [InlineData("", null)]
+    [InlineData("   ", null)]
+    [InlineData("order.created", "")]
+    [InlineData("order.created", "   ")]
+    public async Task Invalid_topic_request_returns_bad_request_without_publishing(string routingKey,
+        string? eventType)
+    {
+        await using var app = new ApiFactory();
+        using var client = app.CreateClient();
+
+        using var response = await client.PostAsJsonAsync("/routing/topic",
+            new { routingKey, eventType });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Empty(app.Publisher.TopicEvents);
+    }
+
+    [Fact]
+    public async Task Long_topic_routing_key_returns_bad_request_without_publishing()
+    {
+        await using var app = new ApiFactory();
+        using var client = app.CreateClient();
+
+        using var response = await client.PostAsJsonAsync("/routing/topic",
+            new { routingKey = new string('x', 256) });
+
+        Assert.Equal(HttpStatusCode.BadRequest, response.StatusCode);
+        Assert.Empty(app.Publisher.TopicEvents);
+    }
+
+    [Fact]
+    public async Task Fanout_publish_failure_returns_service_unavailable()
+    {
+        await using var app = new ApiFactory();
+        app.Publisher.OnPublishFanout = _ =>
+            throw new MessagePublishException("Not confirmed", new IOException("broker down"));
+        using var client = app.CreateClient();
+
+        using var response = await client.PostAsync("/routing/fanout", content: null);
+
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+    }
+
+    [Fact]
+    public async Task Topic_publish_failure_returns_service_unavailable()
+    {
+        await using var app = new ApiFactory();
+        app.Publisher.OnPublishTopic = _ =>
+            throw new MessagePublishException("Not confirmed", new IOException("broker down"));
+        using var client = app.CreateClient();
+
+        using var response = await client.PostAsJsonAsync("/routing/topic",
+            new { routingKey = "order.created" });
+
+        Assert.Equal(HttpStatusCode.ServiceUnavailable, response.StatusCode);
+    }
+
     private static async Task<Guid> CreateOrderAsync(HttpClient client)
     {
         using var response = await client.PostAsJsonAsync("/orders", new { customerName = "Sopanha", totalAmount = 50m });
@@ -332,8 +438,12 @@ public sealed class OrdersApiTests
     {
         public List<OrderCreated> Orders { get; } = [];
         public List<OrderStatusChanged> Statuses { get; } = [];
+        public List<OrderRoutingEvent> FanoutEvents { get; } = [];
+        public List<(OrderRoutingEvent Event, string RoutingKey)> TopicEvents { get; } = [];
         public Func<CancellationToken, Task>? OnPublish { get; set; }
         public Func<CancellationToken, Task>? OnPublishStatus { get; set; }
+        public Func<CancellationToken, Task>? OnPublishFanout { get; set; }
+        public Func<CancellationToken, Task>? OnPublishTopic { get; set; }
 
         public async Task PublishAsync(OrderCreated order, CancellationToken cancellationToken)
         {
@@ -345,6 +455,19 @@ public sealed class OrdersApiTests
         {
             Statuses.Add(status);
             if (OnPublishStatus is not null) await OnPublishStatus(cancellationToken);
+        }
+
+        public async Task PublishFanoutAsync(OrderRoutingEvent routingEvent, CancellationToken cancellationToken)
+        {
+            FanoutEvents.Add(routingEvent);
+            if (OnPublishFanout is not null) await OnPublishFanout(cancellationToken);
+        }
+
+        public async Task PublishTopicAsync(OrderRoutingEvent routingEvent, string routingKey,
+            CancellationToken cancellationToken)
+        {
+            TopicEvents.Add((routingEvent, routingKey));
+            if (OnPublishTopic is not null) await OnPublishTopic(cancellationToken);
         }
     }
 }

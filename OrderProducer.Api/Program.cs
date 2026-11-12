@@ -80,6 +80,60 @@ app.MapPatch("/orders/{orderId:guid}/status",
                 detail: "Check RabbitMQ and try again. A timeout can mean the outcome is unknown; retrying can create duplicates.");
         }
     });
+app.MapPost("/routing/fanout", async (IMessagePublisher publisher, ILogger<Program> logger,
+    CancellationToken cancellationToken) =>
+{
+    var routingEvent = new OrderRoutingEvent(Guid.NewGuid(), OrderRoutingEventTypes.Created,
+        DateTimeOffset.UtcNow, "Fanout routing demo");
+    try
+    {
+        await publisher.PublishFanoutAsync(routingEvent, cancellationToken);
+        return Results.Accepted(value: new
+        {
+            routingEvent.EventId,
+            exchange = RoutingTopology.FanoutExchangeName(rabbitMq),
+            routingEvent.EventType,
+            routingEvent.OccurredAtUtc
+        });
+    }
+    catch (MessagePublishException ex)
+    {
+        logger.LogError(ex, "Publishing fanout event {EventId} failed", routingEvent.EventId);
+        return Results.Problem(statusCode: StatusCodes.Status503ServiceUnavailable,
+            title: "Fanout event could not be confirmed by RabbitMQ",
+            detail: "Check RabbitMQ and try again.");
+    }
+});
+app.MapPost("/routing/topic", async (PublishTopicEventRequest request, IMessagePublisher publisher,
+    ILogger<Program> logger, CancellationToken cancellationToken) =>
+{
+    var errors = request.Validate();
+    if (errors.Count > 0) return Results.ValidationProblem(errors);
+
+    var routingKey = request.RoutingKey!.Trim();
+    var eventType = request.EventType?.Trim() ?? OrderRoutingEventTypes.Created;
+    var routingEvent = new OrderRoutingEvent(Guid.NewGuid(), eventType, DateTimeOffset.UtcNow);
+    try
+    {
+        await publisher.PublishTopicAsync(routingEvent, routingKey, cancellationToken);
+        return Results.Accepted(value: new
+        {
+            routingEvent.EventId,
+            exchange = RoutingTopology.TopicExchangeName(rabbitMq),
+            routingEvent.EventType,
+            routingKey,
+            routingEvent.OccurredAtUtc
+        });
+    }
+    catch (MessagePublishException ex)
+    {
+        logger.LogError(ex, "Publishing topic event {EventId} with routing key {RoutingKey} failed",
+            routingEvent.EventId, routingKey);
+        return Results.Problem(statusCode: StatusCodes.Status503ServiceUnavailable,
+            title: "Topic event could not be confirmed by RabbitMQ",
+            detail: "Check RabbitMQ and try again.");
+    }
+});
 app.Run();
 
 // Allows WebApplicationFactory to start this API in automated tests.

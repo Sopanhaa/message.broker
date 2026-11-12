@@ -6,14 +6,16 @@ A practical demo of asynchronous messaging with ASP.NET Core, a background worke
 
 OrderMessagingSystem accepts orders through a small HTTP API, saves them in SQLite, and publishes an `OrderCreated` message to RabbitMQ. A separate background worker consumes the message, simulates order processing, and updates the order status in the shared database. RabbitMQ is the message broker: it holds messages while the worker is offline and delivers them when the worker reconnects. The API and worker run as independent processes, but they use the same SQLite file and the same RabbitMQ queues. Status updates use a second queue, and failures are handled with retry queues and dead-letter queues (DLQs).
 
+The same API also exposes small routing-demo endpoints. They publish demo events through a **fanout exchange** (one copy to every bound queue) and a **topic exchange** (routing-key pattern matching). Routing demo events are not persisted and do not change the order pipeline. See Section 15.
+
 **Projects in the solution:**
 
 | Folder | Purpose |
 | --- | --- |
-| `OrderProducer.Api` | Minimal API: create and query orders, publish events |
-| `OrderConsumer.Worker` | Background worker: consume orders and status updates, retry failures, update SQLite |
+| `OrderProducer.Api` | Minimal API: create and query orders, publish events, fanout/topic demo endpoints |
+| `OrderConsumer.Worker` | Background worker: consume orders, status updates, and routing-demo messages; retry failures; update SQLite |
 | `OrderPersistence` | EF Core and SQLite storage, including the message deduplication table |
-| `Shared.Contracts` | Event records, RabbitMQ settings, queue topology, retry helpers |
+| `Shared.Contracts` | Event records, RabbitMQ settings, queue/exchange topology, retry helpers |
 | `OrderMessagingSystem.Tests` | Unit tests and optional RabbitMQ integration tests |
 
 ```mermaid
@@ -39,8 +41,12 @@ The API exposes these endpoints on `http://localhost:5000`:
 | `POST` | `/orders` | Save an order and publish `OrderCreated` | `202` | `400`, `409`, `503` |
 | `GET` | `/orders/{orderId}` | Read the persisted order | `200` | `404` |
 | `PATCH` | `/orders/{orderId}/status` | Publish `OrderStatusChanged` | `202` | `400`, `404`, `503` |
+| `POST` | `/routing/fanout` | Publish a demo event to the fanout exchange | `202` | `503` |
+| `POST` | `/routing/topic` | Publish a demo event to the topic exchange | `202` | `400`, `503` |
 
 `POST /orders` and `PATCH /orders/{id}/status` return `202` only after RabbitMQ confirms the publish. If the broker does not confirm in time, they return `503`; a failed `POST` also removes the row it just inserted. `POST /orders` returns `409` only if the server-generated order ID already exists, which is practically impossible. See Section 9 for full request and response examples.
+
+The `/routing/*` endpoints are demo-only: they publish events but do not write to SQLite. See Section 15.
 
 ### Delivery guarantees
 
@@ -180,8 +186,15 @@ Both apps declare the same durable topology on startup or first publish. The bas
 | Status DLQ | `orders.status.dead-letter` | Status updates that failed permanently or exhausted retries |
 | Retry queues | `orders.retry.5s`, `orders.retry.30s`, `orders.retry.5m` | Delayed order retries |
 | Status retry queues | `orders.status.retry.5s`, `orders.status.retry.30s`, `orders.status.retry.5m` | Delayed status retries |
+| Fanout exchange | `orders.fanout` | Broadcasts routing-demo events to every bound queue |
+| Fanout queues | `orders.fanout.email`, `orders.fanout.logging` | Demo email and logging consumers |
+| Topic exchange | `orders.topic` | Routes routing-demo events by routing-key pattern |
+| Topic queues | `orders.topic.order`, `orders.topic.notification`, `orders.topic.audit` | Bound with `order.*`, `order.created`, and `#` |
+| Routing DLX / DLQ | `orders.routing.dlx`, `orders.routing.dead-letter` | Dead-letters failed routing-demo messages |
 
 Retry queues use a per-queue message TTL and dead-letter an expired message back to its main queue, not to the DLQ. The worker also writes an `x-retry-attempt` header as a second, independent guard, so a lost or stripped `x-death` header cannot silently reset the retry count.
+
+The routing-demo exchanges, queues, and DLQ are separate from the order/status pipeline. They do not change the existing retry schedule or DLQ behavior.
 
 ### Environment variables
 
@@ -330,6 +343,12 @@ Waiting for orders in orders and status updates in orders.status; prefetch=1 per
 
 This means the worker connected to RabbitMQ, declared the main queues, retry queues, and dead-letter exchanges, and is waiting for messages.
 
+The worker also starts the routing-demo consumers and logs a second line:
+
+```text
+Waiting for routing demo messages in orders.fanout.email, orders.fanout.logging, orders.topic.order, orders.topic.notification, orders.topic.audit; prefetch=1 per queue, manual acknowledgments enabled
+```
+
 If RabbitMQ is not ready, the worker logs `Consumer connection failed` and retries every 5 seconds. Start RabbitMQ and watch it recover.
 
 Leave this terminal running. Stop the worker with `Ctrl+C`.
@@ -473,8 +492,11 @@ You should see:
 | `orders.status.retry.5s`, `orders.status.retry.30s`, `orders.status.retry.5m` | Delayed status retries |
 | `orders.dead-letter` | Orders that failed permanently |
 | `orders.status.dead-letter` | Status updates that failed permanently |
+| `orders.fanout.email`, `orders.fanout.logging` | Fanout demo queues; both receive every fanout event |
+| `orders.topic.order`, `orders.topic.notification`, `orders.topic.audit` | Topic demo queues bound with `order.*`, `order.created`, and `#` |
+| `orders.routing.dead-letter` | Failed fanout/topic demo messages |
 
-An empty `orders` queue is normal: the worker may have already processed the message. Retry queues have no consumers and drain themselves when their TTL expires.
+An empty `orders` queue is normal: the worker may have already processed the message. Retry queues have no consumers and drain themselves when their TTL expires. The routing demo queues stay empty until you use the endpoints in Section 15.
 
 ### Step 9 Check the saved order
 
@@ -650,13 +672,13 @@ dotnet test --filter "FullyQualifiedName~OrderConsumerTests|FullyQualifiedName~P
 
 Expected: **92 passed**.
 
-These integration tests need RabbitMQ and take about 6 seconds. They check the retry TTLs, the first 5-second retry, and retry metadata:
+These integration tests need RabbitMQ. They check the retry TTLs, the first 5-second retry, retry metadata, fanout broadcast, exact/`*`/`#` topic routing, and multiple consumers:
 
 ```bash
 RABBITMQ_INTEGRATION_TESTS=1 dotnet test --filter "FullyQualifiedName~RabbitMqIntegrationTests"
 ```
 
-Expected: **3 passed**.
+Expected: **9 passed**.
 
 The 30-second and 5-minute delays are covered by the schedule and topology unit tests; the integration suite does not wait for them.
 
@@ -671,20 +693,20 @@ dotnet test
 Expected result on a clean run:
 
 ```text
-Passed!  - Failed: 0, Passed: 134, Skipped: 3, Total: 137
+Passed!  - Failed: 0, Passed: 160, Skipped: 9, Total: 169
 ```
 
-**This result was verified on this repository.** The three skipped tests are the opt-in RabbitMQ integration tests.
+**This result was verified on this repository.** The nine skipped tests are the opt-in RabbitMQ integration tests.
 
 - The default test run **does not need RabbitMQ**.
-- The default tests use temporary SQLite files, and the opt-in integration tests use temporary RabbitMQ queue names, so they do not touch your local order database or the main queues.
+- The default tests use temporary SQLite files, and the opt-in integration tests use temporary RabbitMQ queue and exchange names, so they do not touch your local order database or the main queues.
 - To include the integration tests, start RabbitMQ and run:
 
   ```bash
   RABBITMQ_INTEGRATION_TESTS=1 dotnet test --filter "FullyQualifiedName~RabbitMqIntegrationTests"
   ```
 
-  Expected: `Passed: 3`.
+  Expected: `Passed: 9`.
 
 On PowerShell:
 
@@ -747,6 +769,7 @@ Prefer `docker compose stop` if you only want to pause RabbitMQ but keep the con
 | Duplicate messages appear to be processed twice | Some work can be repeated if the process crashes between the work and recording the message ID. Status writes are timestamp-guarded, so the final state remains consistent. |
 | The SQLite file keeps growing | `ProcessedMessages` has no automatic cleanup. Stop the apps, delete old rows manually, for example `DELETE FROM ProcessedMessages WHERE ProcessedAtUtc < '2026-01-01';`, then run `VACUUM;`. |
 | The worker says an order was not found | The API and worker are using different SQLite files. Set the same `Database__Path` for both processes, or remove the override and use the defaults. |
+| Fanout/topic demo messages are not routed as expected | See the routing troubleshooting table in Section 15. |
 
 ## 14. Quick Start
 
@@ -786,6 +809,18 @@ Then query it:
 curl http://localhost:5000/orders/PASTE_ORDER_ID_HERE
 ```
 
+Send routing-demo events:
+
+```bash
+# Broadcast to both fanout queues
+curl -X POST http://localhost:5000/routing/fanout
+
+# Route by topic key
+curl -X POST http://localhost:5000/routing/topic \
+  -H 'Content-Type: application/json' \
+  -d '{"routingKey":"order.created"}'
+```
+
 Stop with `Ctrl+C` in Terminals 2 and 3, then:
 
 ```bash
@@ -803,3 +838,190 @@ Send the order with the same `curl` command, then stop everything with:
 ```bash
 docker compose --profile app down
 ```
+
+## 15. Fanout and Topic Exchanges
+
+The order pipeline publishes through RabbitMQ's **default exchange**. That is a direct exchange: one routing key selects one queue. This section adds two named exchanges to show two other routing styles. Both are demo-only and do not write to SQLite.
+
+### Fanout vs topic
+
+| Feature | Fanout exchange | Topic exchange |
+| --- | --- | --- |
+| Routing key | Ignored | Matched against patterns |
+| Delivery | One copy per bound queue | One copy per matching binding |
+| Wildcards | None | `*` (one word) and `#` (zero or more words) |
+| Typical use | Broadcast to every interested service | Selective subscriptions |
+
+### Fanout exchange
+
+`POST /routing/fanout` publishes one `OrderRoutingEvent` to the durable fanout exchange `orders.fanout`.
+
+```mermaid
+flowchart LR
+    API["POST /routing/fanout"] --> FAN["orders.fanout\n(fanout)"]
+    FAN --> EMAIL["orders.fanout.email"]
+    FAN --> LOG["orders.fanout.logging"]
+    EMAIL --> EC["Email consumer"]
+    LOG --> LC["Logging consumer"]
+```
+
+Both queues are bound with an empty routing key. RabbitMQ ignores the routing key for a fanout exchange, so every bound queue receives its own copy. The two consumers are independent; they do not split the message between them.
+
+### Topic exchange
+
+`POST /routing/topic` publishes to the durable topic exchange `orders.topic` using the `routingKey` from the request.
+
+| Queue | Binding pattern | Receives |
+| --- | --- | --- |
+| `orders.topic.order` | `order.*` | Any routing key with exactly two words where the first word is `order` |
+| `orders.topic.notification` | `order.created` | Only `order.created` |
+| `orders.topic.audit` | `#` | Every routing key |
+
+```mermaid
+flowchart LR
+    API["POST /routing/topic"] --> TOPIC["orders.topic\n(topic)"]
+    TOPIC -->|"order.*"| ORDER["orders.topic.order"]
+    TOPIC -->|"order.created"| NOTIFY["orders.topic.notification"]
+    TOPIC -->|"#"| AUDIT["orders.topic.audit"]
+```
+
+Why each queue receives a message:
+
+- `order.created` matches all three bindings, so all three queues receive a copy.
+- `order.updated` matches `order.*` and `#`, so only the order and audit queues receive a copy.
+- `order.cancelled` behaves the same as `order.updated`.
+- `order.created.extra` has three words, so `order.*` does not match. Only `#` matches, so only audit receives a copy.
+- `payment.created` matches only `#`, so only audit receives a copy.
+
+Because the audit queue is bound with `#`, every topic message reaches audit. There is no "no queue at all" case in this topology. The topic tests verify that the order and notification queues do not receive non-matching keys.
+
+### Run the routing demo
+
+Start RabbitMQ, the API, and the worker as described in Sections 5, 7, and 8. The worker startup log includes:
+
+```text
+Waiting for routing demo messages in orders.fanout.email, orders.fanout.logging, orders.topic.order, orders.topic.notification, orders.topic.audit; prefetch=1 per queue, manual acknowledgments enabled
+```
+
+Publish a fanout event (no request body):
+
+```bash
+curl -i -X POST http://localhost:5000/routing/fanout
+```
+
+Expected response:
+
+```json
+{
+  "eventId": "9178b922-35af-4bd0-bf16-ac7b6cbe2977",
+  "exchange": "orders.fanout",
+  "eventType": "OrderCreated",
+  "occurredAtUtc": "2026-11-12T09:51:45.0525948+00:00"
+}
+```
+
+Publish a topic event:
+
+```bash
+curl -i -X POST http://localhost:5000/routing/topic \
+  -H 'Content-Type: application/json' \
+  -d '{"routingKey":"order.created","eventType":"OrderCreated"}'
+```
+
+Expected response:
+
+```json
+{
+  "eventId": "3d88520f-a1c2-4ecc-b89f-8fa1b9007100",
+  "exchange": "orders.topic",
+  "eventType": "OrderCreated",
+  "routingKey": "order.created",
+  "occurredAtUtc": "2026-11-12T09:51:45.4979085+00:00"
+}
+```
+
+Try the other keys:
+
+```bash
+curl -X POST http://localhost:5000/routing/topic \
+  -H 'Content-Type: application/json' \
+  -d '{"routingKey":"order.updated","eventType":"OrderUpdated"}'
+
+curl -X POST http://localhost:5000/routing/topic \
+  -H 'Content-Type: application/json' \
+  -d '{"routingKey":"payment.created","eventType":"PaymentCreated"}'
+```
+
+In the worker terminal you should see one line per receiving queue:
+
+```text
+[orders.fanout.email] received OrderCreated event <event-id> ...
+[orders.fanout.logging] received OrderCreated event <event-id> ...
+[orders.topic.order] received OrderCreated event <event-id> ...
+[orders.topic.notification] received OrderCreated event <event-id> ...
+[orders.topic.audit] received OrderCreated event <event-id> ...
+```
+
+The `eventType` field is optional and defaults to `OrderCreated`. `routingKey` is required and is trimmed before publishing.
+
+### Expected routing results
+
+| Routing key | `orders.topic.order` (`order.*`) | `orders.topic.notification` (`order.created`) | `orders.topic.audit` (`#`) |
+| --- | --- | --- | --- |
+| `order.created` | Yes | Yes | Yes |
+| `order.updated` | Yes | No | Yes |
+| `order.cancelled` | Yes | No | Yes |
+| `order.created.extra` | No | No | Yes |
+| `payment.created` | No | No | Yes |
+
+### Inspect the exchanges
+
+Open **http://localhost:15673** → **Exchanges**:
+
+| Exchange | Type |
+| --- | --- |
+| `orders.fanout` | `fanout` |
+| `orders.topic` | `topic` |
+| `orders.routing.dlx` | `direct` |
+
+Then open **Queues and Streams** and select a demo queue to inspect its bindings. The demo queues normally show `Ready: 0` after the worker consumes the events.
+
+### Test the routing demo
+
+The default test run covers API publishing, topology declarations, payload validation, and ACK/NACK behavior without RabbitMQ:
+
+```bash
+dotnet test
+```
+
+Expected: `Passed: 160, Skipped: 9, Total: 169`.
+
+The opt-in integration tests verify real broker routing:
+
+```bash
+RABBITMQ_INTEGRATION_TESTS=1 dotnet test --filter "FullyQualifiedName~RabbitMqIntegrationTests"
+```
+
+Expected: `Passed: 9`.
+
+They cover fanout copies, exact topic routing, `*` wildcard behavior, `#` catch-all behavior, keys that do not match a specific binding, and two independent consumers.
+
+### Routing troubleshooting
+
+| Problem | Fix |
+| --- | --- |
+| `POST /routing/*` returns `503` | RabbitMQ is not reachable or did not confirm the publish. Check `docker compose ps` and the API log. |
+| Fanout queues stay empty | Confirm the worker is running and its log contains `Waiting for routing demo messages`. Check that the API and worker use the same RabbitMQ host, port, and virtual host. |
+| Every topic message appears in `orders.topic.audit` | This is expected: `#` is a catch-all. Use the expected-results table to check the other queues. |
+| `order.updated` is missing from `orders.topic.notification` | Expected: that queue is bound only to `order.created`. |
+| `order.created.extra` is missing from `orders.topic.order` | Expected: `*` matches exactly one word, so it does not cross the extra dot. |
+| Routing messages are rejected | Check the worker log for `invalid payload`; inspect `orders.routing.dead-letter`. |
+| Port `5000` is already in use | Stop the process or container using the port before starting the API. |
+
+### Limitations
+
+- Routing demo events are not saved to SQLite.
+- The demo queues have a dead-letter queue but no 5s/30s/5m retry schedule. That retry mechanism remains exclusive to the order and status queues.
+- The routing consumers use a separate RabbitMQ connection from the order/status consumers. This is intentional so demo traffic cannot delay order processing.
+- The audit queue receives every topic message because of the `#` binding.
+- The demo publishes with `mandatory: true`. If an exchange has no matching queue, the API returns `503` instead of silently dropping the event.
