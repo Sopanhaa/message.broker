@@ -28,6 +28,29 @@ flowchart LR
     Worker -->|"permanent failure"| DLQ["Dead-letter queues"]
 ```
 
+### HTTP endpoints
+
+The API exposes these endpoints on `http://localhost:5000`:
+
+| Method | Path | Purpose | Success | Errors |
+| --- | --- | --- | --- | --- |
+| `GET` | `/` | Service name and status | `200` | — |
+| `GET` | `/health` | Liveness only; does not check RabbitMQ | `200` | — |
+| `POST` | `/orders` | Save an order and publish `OrderCreated` | `202` | `400`, `409`, `503` |
+| `GET` | `/orders/{orderId}` | Read the persisted order | `200` | `404` |
+| `PATCH` | `/orders/{orderId}/status` | Publish `OrderStatusChanged` | `202` | `400`, `404`, `503` |
+
+`POST /orders` and `PATCH /orders/{id}/status` return `202` only after RabbitMQ confirms the publish. If the broker does not confirm in time, they return `503`; a failed `POST` also removes the row it just inserted. `POST /orders` returns `409` only if the server-generated order ID already exists, which is practically impossible. See Section 9 for full request and response examples.
+
+### Delivery guarantees
+
+RabbitMQ gives **at-least-once** delivery. Messages can be redelivered after a lost acknowledgment, a reconnect, or a retry, so the worker must tolerate duplicates:
+
+- Every published message has a unique `MessageId`. An `OrderCreated` message reuses the order ID (an order is created once); each `OrderStatusChanged` publish gets a new GUID.
+- Before processing, the worker checks the `ProcessedMessages` table. A message ID that was already completed is acknowledged and skipped, so a duplicate does not repeat the work.
+- Status updates are also guarded by time: `ApplyStatusAsync` updates the order only when the message's `UpdatedAtUtc` is newer than the stored status timestamp. Stale or out-of-order updates are ignored, and the message is still acknowledged.
+- The `ProcessedMessages` inbox has no automatic cleanup. It grows by one row per processed message; delete old rows manually if the file becomes large.
+
 ## 2. Prerequisites
 
 Install these tools before you start:
@@ -96,11 +119,12 @@ Both `OrderProducer.Api/appsettings.json` and `OrderConsumer.Worker/appsettings.
 - **Port `5673`** is the host port mapped to RabbitMQ's AMQP port `5672` inside Docker.
 - **`orderdev` / `orderdev_password`** are development-only credentials. Do not reuse them on a public server.
 - **`QueueName`** is the base name. The app also uses `orders.status`, the retry queues, and two dead-letter queues.
+- **`PublishTimeoutSeconds`** bounds the whole publish operation—connecting, declaring the topology, and waiting for broker confirmation—before the API returns `503`. Valid values are 1 to 300.
 - **Both files must match.** If the API and worker use different credentials, ports, or queue names, they cannot communicate.
 
 ### Docker Compose settings
 
-`docker-compose.yml` creates the RabbitMQ user from these variables:
+`docker-compose.yml` runs `rabbitmq:4.2-management`. It creates the RabbitMQ user from these variables:
 
 ```yaml
 RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-orderdev}
@@ -132,6 +156,32 @@ Database__Path=/tmp/orders.db dotnet run --project OrderConsumer.Worker
 ```
 
 A relative path is resolved under the default `OrderMessagingSystem` folder. If you set this variable for only one process, the two apps will use different databases and the worker will not find the API's orders.
+
+The schema is created with `EnsureCreated` and uses two tables:
+
+| Table | Contents |
+| --- | --- |
+| `Orders` | One row per order: customer, total, products JSON, current status and status detail |
+| `ProcessedMessages` | Inbox of completed message IDs, used to skip duplicate deliveries |
+
+The database uses WAL mode so the API and worker can read and write the same file concurrently.
+
+### RabbitMQ queue topology
+
+Both apps declare the same durable topology on startup or first publish. The base queue name comes from `RabbitMq:QueueName` (default `orders`):
+
+| Object | Default name | Purpose |
+| --- | --- | --- |
+| Order queue | `orders` | `OrderCreated` messages |
+| Status queue | `orders.status` | `OrderStatusChanged` messages |
+| Order DLX | `orders.dlx` | Routes rejected messages to the order DLQ and expired retries back to `orders` |
+| Order DLQ | `orders.dead-letter` | Orders that failed permanently or exhausted retries |
+| Status DLX | `orders.status.dlx` | Routes rejected messages to the status DLQ and expired retries back to `orders.status` |
+| Status DLQ | `orders.status.dead-letter` | Status updates that failed permanently or exhausted retries |
+| Retry queues | `orders.retry.5s`, `orders.retry.30s`, `orders.retry.5m` | Delayed order retries |
+| Status retry queues | `orders.status.retry.5s`, `orders.status.retry.30s`, `orders.status.retry.5m` | Delayed status retries |
+
+Retry queues use a per-queue message TTL and dead-letter an expired message back to its main queue, not to the DLQ. The worker also writes an `x-retry-attempt` header as a second, independent guard, so a lost or stripped `x-death` header cannot silently reset the retry count.
 
 ### Environment variables
 
@@ -335,6 +385,17 @@ If you use Postman:
 - Header: `Content-Type: application/json`
 - Body → raw → JSON: the JSON shown above.
 
+#### Request body
+
+| Field | Required | Rules |
+| --- | --- | --- |
+| `customerName` | Yes | 1 to 100 characters after trimming |
+| `totalAmount` | Yes | Must be greater than zero |
+| `products` | No | If supplied, must be a non-empty array. Each item needs a `name` of 1 to 100 characters after trimming, a `quantity` greater than zero, and a `unitPrice` greater than zero |
+| `products[].*` totals | — | `quantity * unitPrice`, summed over all products, must equal `totalAmount` exactly |
+
+If `products` is omitted or `null`, the order is accepted without line items. If it is present but empty or invalid, the API returns `400` and does not publish anything.
+
 ### Step 6 Check the API response
 
 A successful request returns `HTTP/1.1 202 Accepted` and a body like this:
@@ -349,7 +410,7 @@ A successful request returns `HTTP/1.1 202 Accepted` and a body like this:
 
 **This is example output.** Your `orderId` and `createdAtUtc` will be different. Copy the `orderId`; you will need it in Step 9.
 
-If you get `400 Bad Request`, check that `totalAmount` equals the sum of `quantity * unitPrice` for all products. If you get `503 Service Unavailable`, RabbitMQ is not reachable.
+If you get `400 Bad Request`, the response lists the invalid fields. Check `customerName`, `totalAmount`, and—when `products` is supplied—that each product is valid and the products add up exactly to `totalAmount`. If you get `503 Service Unavailable`, RabbitMQ did not confirm the publish.
 
 ### Step 7 Watch the worker
 
@@ -410,7 +471,7 @@ Expected structure:
 }
 ```
 
-**Example output.** Right after creation, the status may still be `Received` or `Processing`. Wait one or two seconds and request it again; it should become `Completed`.
+**Example output.** Right after creation, the status may still be `Received` or `Processing`. Wait one or two seconds and request it again; it should become `Completed`. An unknown order ID returns `404 Not Found`.
 
 #### Optional: update the status
 
@@ -422,7 +483,12 @@ curl -i -X PATCH http://localhost:5000/orders/PASTE_ORDER_ID_HERE/status \
 
 The API returns `202 Accepted`. After the worker applies the update, `GET /orders/{id}` shows `"status": "Failed"` and `"statusDetail": "Manual review"`.
 
-Accepted status values are `Received`, `Processing`, `Completed`, and `Failed`. `detail` is optional and limited to 500 characters.
+| Field | Required | Rules |
+| --- | --- | --- |
+| `status` | Yes | One of `Received`, `Processing`, `Completed`, `Failed` |
+| `detail` | No | Up to 500 characters after trimming; stored as `null` when empty |
+
+The order must already exist, otherwise the API returns `404`. The worker applies an update only when its `UpdatedAtUtc` is newer than the stored status timestamp, so a stale or out-of-order update is ignored rather than overwriting a newer status.
 
 #### Optional: query SQLite directly
 
@@ -456,7 +522,9 @@ The retry queues are:
 | 3 | `orders.retry.5m` | `orders.status.retry.5m` | 5 minutes |
 | After 3 | `orders.dead-letter` | `orders.status.dead-letter` | No more retries |
 
-Each retry preserves the original payload and message ID. The worker acknowledges the original delivery only after RabbitMQ confirms the retry publish.
+Each retry preserves the original payload, `MessageId`, correlation ID, message type, content type, encoding, and timestamp, and adds an `x-retry-attempt` header. The worker acknowledges the original delivery only after RabbitMQ confirms the retry publish. If the retry publish cannot be confirmed, the original message is left unacknowledged and is redelivered after the worker reconnects; this can produce a duplicate copy, which the worker's message-ID check tolerates.
+
+The worker reconnects after any connection or channel loss, waits 5 seconds, and re-declares the topology before consuming again. Deliveries that were in flight but not acknowledged are redelivered by RabbitMQ.
 
 ### Observe a retry (optional, local only)
 
@@ -620,6 +688,8 @@ rm ~/.local/share/OrderMessagingSystem/orders.db
 
 On macOS, delete `~/Library/Application Support/OrderMessagingSystem/orders.db`. On Windows, delete `%LOCALAPPDATA%\OrderMessagingSystem\orders.db`. This removes order history and deduplication records; the schema is recreated on the next startup.
 
+Stopping the worker with `Ctrl+C` cancels in-flight work and leaves unacknowledged deliveries on the broker, so they are redelivered on the next start. The worker allows up to 15 seconds for a graceful shutdown.
+
 Prefer `docker compose stop` if you only want to pause RabbitMQ but keep the containers.
 
 ## 13. Troubleshooting
@@ -639,6 +709,10 @@ Prefer `docker compose stop` if you only want to pause RabbitMQ but keep the con
 | RabbitMQ login fails | Use the defaults `orderdev` / `orderdev_password`, or your `RABBITMQ_USER` / `RABBITMQ_PASSWORD` values. If you changed them after the volume was created, either use the new credentials in both `appsettings.json` files or reset the volume with `docker compose down -v` (this deletes broker data). |
 | `GET /health` returns `200` but orders fail | `/health` is liveness only. Check RabbitMQ with `docker compose ps`. |
 | The API returns `503` | RabbitMQ did not confirm the publish. Start RabbitMQ and check the API log. The order row is rolled back. |
+| `PATCH /orders/{id}/status` returns `404` | The order does not exist in the database the API is using. Check the ID and that `Database__Path` matches between processes. |
+| A status update returns `202` but the order does not change | The update was stale: the worker applies only messages with a newer `UpdatedAtUtc` than the stored status. Send the update again; do not reuse an old timestamp. |
+| Duplicate messages appear to be processed twice | Some work can be repeated if the process crashes between the work and recording the message ID. Status writes are timestamp-guarded, so the final state remains consistent. |
+| The SQLite file keeps growing | `ProcessedMessages` has no automatic cleanup. Stop the apps, delete old rows manually, for example `DELETE FROM ProcessedMessages WHERE ProcessedAtUtc < '2026-01-01';`, then run `VACUUM;`. |
 | The worker says an order was not found | The API and worker are using different SQLite files. Set the same `Database__Path` for both processes, or remove the override and use the defaults. |
 
 ## 14. Quick Start
