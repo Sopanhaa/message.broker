@@ -1,7 +1,5 @@
 # Order Messaging 
 
-[![CI](https://github.com/Sopanhaa/message.broker/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/Sopanhaa/message.broker/actions/workflows/ci.yml)
-
 A practical demo of asynchronous messaging with ASP.NET Core, a background worker, RabbitMQ, and SQLite.
 
 ## 1. Project Overview
@@ -677,8 +675,6 @@ Passed!  - Failed: 0, Passed: 134, Skipped: 3, Total: 137
 ```
 
 **This result was verified on this repository.** The three skipped tests are the opt-in RabbitMQ integration tests.
-
-Continuous integration runs on every push to `main` and every pull request (`.github/workflows/ci.yml`): it builds with warnings as errors, runs the unit suite, runs the RabbitMQ integration tests against a service container, and builds both Docker images.
 
 - The default test run **does not need RabbitMQ**.
 - The default tests use temporary SQLite files, and the opt-in integration tests use temporary RabbitMQ queue names, so they do not touch your local order database or the main queues.
