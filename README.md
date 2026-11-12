@@ -334,6 +334,37 @@ If RabbitMQ is not ready, the worker logs `Consumer connection failed` and retri
 
 Leave this terminal running. Stop the worker with `Ctrl+C`.
 
+### Alternative: run the API and worker in containers
+
+The repository includes a Dockerfile for each service and an optional `app` Compose profile. It builds both images, connects them to the same RabbitMQ container, and stores SQLite in the shared `orders_data` volume.
+
+From the repository root:
+
+```bash
+docker compose --profile app up -d --build --wait
+```
+
+- API: http://localhost:5000
+- RabbitMQ Management UI: http://localhost:15673
+- SQLite file: `/data/orders.db` inside both containers, backed by the `orders_data` volume
+
+The containers override `RabbitMq:HostName` to `rabbitmq`, `RabbitMq:Port` to `5672`, and set `Database__Path=/data/orders.db`. The profile is optional, so `docker compose up -d --wait` (Section 5) still starts only RabbitMQ. Do not run `dotnet run` for the API or worker at the same time; port `5000` would conflict and the two processes would use different databases.
+
+Check the containers and follow their logs:
+
+```bash
+docker compose --profile app ps
+docker compose --profile app logs -f api worker
+```
+
+Stop the containers while keeping the database and broker volumes:
+
+```bash
+docker compose --profile app down
+```
+
+Run `--build` again after changing code; the image layers reuse the NuGet restore when only source files change.
+
 ## 9. Test Project 
 
 ### Step 1 Check RabbitMQ
@@ -676,11 +707,11 @@ Stop the applications first:
    docker compose down
    ```
 
-`docker compose down` stops and removes the containers but keeps the named volume `rabbitmq_data`. Queued messages survive.
+`docker compose down` stops and removes the containers but keeps the named volumes `rabbitmq_data` and, when the `app` profile was used, `orders_data`. Queued messages and the container-mode SQLite database survive.
 
-`docker compose down -v` also deletes the volume. **This permanently deletes RabbitMQ data**, including queued messages and any custom users. Use it only when you want a clean broker.
+`docker compose down -v` also deletes the volumes. **This permanently deletes RabbitMQ data** and, when the `app` profile was used, the SQLite database. Use it only when you want a clean broker and an empty database.
 
-The SQLite file is not managed by Docker and survives `docker compose down`. To reset it:
+For a local `dotnet run` setup, the SQLite file is not managed by Docker and survives `docker compose down`. To reset it:
 
 ```bash
 rm ~/.local/share/OrderMessagingSystem/orders.db
@@ -700,7 +731,9 @@ Prefer `docker compose stop` if you only want to pause RabbitMQ but keep the con
 | `docker compose: command not found` | Install the Docker Compose v2 plugin (https://docs.docker.com/compose/install/linux/), or use Docker Desktop, which includes it. |
 | `RabbitMQ connection refused` | Run `docker compose ps`. Wait for `healthy`. If it is not running, run `docker compose up -d --wait`. Check `docker compose logs rabbitmq`. |
 | Port `5673` or `15673` is already in use | Stop the other service using the port (`ss -ltnp \| grep 5673` on Linux, `lsof -i :5673` on macOS). Or change the host ports in `docker-compose.yml` and `RabbitMq:Port` in both `appsettings.json` files. |
-| Port `5000` is already in use | Stop the process using it (`ss -ltnp \| grep 5000` or `lsof -i :5000`), then start the API again. |
+| Port `5000` is already in use | Stop the process using it (`ss -ltnp \| grep 5000` or `lsof -i :5000`), or stop the API container with `docker compose --profile app stop api`. Then start the API again. |
+| Docker build fails at `dotnet restore` | Check network access to nuget.org and that Docker has enough memory. Re-run with `docker compose --profile app build --no-cache`. |
+| Containers start but cannot reach RabbitMQ | Inside Compose, use host `rabbitmq` and internal port `5672`, not `localhost:5673`. The `app` profile already sets these values. |
 | API fails to start | Run `dotnet build` and read the first error. Confirm the .NET 10 SDK is installed (`dotnet --list-sdks`) and the database folder is writable. |
 | Worker cannot connect | RabbitMQ must be running, and both `appsettings.json` files must use the same host, port, user, password, and virtual host. The worker retries every 5 seconds. |
 | `SQLite database is locked` | Close any `sqlite3` session holding `BEGIN EXCLUSIVE`. The worker retries transient SQLite busy/locked errors automatically. Do not run manual locks during normal use. |
@@ -757,4 +790,16 @@ Stop with `Ctrl+C` in Terminals 2 and 3, then:
 
 ```bash
 docker compose down
+```
+
+**Or run the API and worker in Docker**
+
+```bash
+docker compose --profile app up -d --build --wait
+```
+
+Send the order with the same `curl` command, then stop everything with:
+
+```bash
+docker compose --profile app down
 ```

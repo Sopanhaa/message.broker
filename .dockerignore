@@ -1,0 +1,16 @@
+.git
+.gitignore
+.idea
+.vs
+.vscode
+**/bin
+**/obj
+**/TestResults
+*.user
+*.suo
+.env
+*.log
+README.md
+docker-compose.yml
+OrderMessagingSystem.slnx
+OrderMessagingSystem.Tests

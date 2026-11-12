@@ -19,5 +19,62 @@ services:
       retries: 12
       start_period: 20s
     restart: unless-stopped
+
+  # Optional containers. Start them with:
+  #   docker compose --profile app up -d --build --wait
+  api:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: OrderProducer.Api/Dockerfile
+    ports:
+      - "127.0.0.1:5000:8080"
+    environment:
+      RabbitMq__HostName: rabbitmq
+      RabbitMq__Port: "5672"
+      RabbitMq__UserName: ${RABBITMQ_USER:-orderdev}
+      RabbitMq__Password: ${RABBITMQ_PASSWORD:-orderdev_password}
+      RabbitMq__VirtualHost: /
+      RabbitMq__QueueName: orders
+      RabbitMq__PublishTimeoutSeconds: "10"
+      Database__Path: /data/orders.db
+    volumes:
+      - orders_data:/data
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      # The aspnet image has bash but no curl/wget; a TCP connect is enough for readiness.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8080"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  worker:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: OrderConsumer.Worker/Dockerfile
+    environment:
+      RabbitMq__HostName: rabbitmq
+      RabbitMq__Port: "5672"
+      RabbitMq__UserName: ${RABBITMQ_USER:-orderdev}
+      RabbitMq__Password: ${RABBITMQ_PASSWORD:-orderdev_password}
+      RabbitMq__VirtualHost: /
+      RabbitMq__QueueName: orders
+      RabbitMq__PublishTimeoutSeconds: "10"
+      Database__Path: /data/orders.db
+    volumes:
+      - orders_data:/data
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   rabbitmq_data:
+  orders_data:
