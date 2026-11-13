@@ -32,6 +32,27 @@ public sealed class RabbitMqTopologyTests
             settings.StatusRetryQueues.Select(queue => queue.QueueName));
     }
 
+    [Fact]
+    public void Two_consumers_per_queue_is_the_default()
+    {
+        Assert.Equal(2, new RabbitMqSettings().ConsumerCount);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(17)]
+    public void Consumer_count_must_be_between_one_and_sixteen(int consumerCount)
+    {
+        var settings = new RabbitMqSettings
+        {
+            UserName = "user",
+            Password = "password",
+            ConsumerCount = consumerCount
+        };
+
+        Assert.Throws<InvalidOperationException>(settings.Validate);
+    }
+
     private static void AssertStream(TopologyProxy calls, string queueName, string deadLetterExchange,
         string deadLetterQueue, string retryReturnRoutingKey, IReadOnlyList<RetryQueue> retryQueues)
     {

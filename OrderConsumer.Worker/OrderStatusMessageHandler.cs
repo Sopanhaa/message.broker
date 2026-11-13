@@ -12,7 +12,8 @@ public sealed class OrderStatusMessageHandler(
 {
     public async Task HandleAsync(IChannel channel, ReadOnlyMemory<byte> body, ulong deliveryTag,
         CancellationToken cancellationToken, string? messageId = null,
-        IReadOnlyBasicProperties? properties = null, IRetryPublisher? retryPublisher = null)
+        IReadOnlyBasicProperties? properties = null, IRetryPublisher? retryPublisher = null,
+        string? consumerId = null)
     {
         OrderStatusChanged update;
         try
@@ -39,12 +40,16 @@ public sealed class OrderStatusMessageHandler(
             if (cancellationToken.IsCancellationRequested) return;
 
             // Invalid JSON or schema is permanent: retrying cannot fix the payload.
-            logger.LogError(ex, "Status delivery {DeliveryTag} has an invalid payload; rejecting to {DeadLetterQueue}",
-                deliveryTag, settings.StatusDeadLetterQueue);
+            logger.LogError(ex,
+                "Consumer {ConsumerId} rejected status delivery {DeliveryTag} with an invalid payload (status: dead-lettered to {DeadLetterQueue})",
+                consumerId, deliveryTag, settings.StatusDeadLetterQueue);
             await channel.BasicNackAsync(deliveryTag, multiple: false, requeue: false,
                 cancellationToken: cancellationToken);
             return;
         }
+
+        logger.LogInformation("Consumer {ConsumerId} received status update for order {OrderId} (status: processing)",
+            consumerId, update.OrderId);
 
         // A redelivery after a lost ACK is expected. Skip work already completed for this message.
         // Settlement is outside the try so a failed ACK reconnects instead of NACKing twice.
@@ -64,6 +69,8 @@ public sealed class OrderStatusMessageHandler(
 
             await ScheduleRetryAsync(channel, body, deliveryTag, messageId, properties, retryPublisher,
                 ex, cancellationToken);
+            logger.LogWarning("Consumer {ConsumerId} status update for order {OrderId} (status: retry scheduled)",
+                consumerId, update.OrderId);
             return;
         }
         catch (Exception ex)
@@ -71,8 +78,8 @@ public sealed class OrderStatusMessageHandler(
             if (cancellationToken.IsCancellationRequested) return;
 
             logger.LogError(ex,
-                "Deduplication check for status delivery {DeliveryTag} failed; rejecting to {DeadLetterQueue}",
-                deliveryTag, settings.StatusDeadLetterQueue);
+                "Consumer {ConsumerId} could not check duplication for status update of order {OrderId} (status: dead-lettered to {DeadLetterQueue})",
+                consumerId, update.OrderId, settings.StatusDeadLetterQueue);
             await channel.BasicNackAsync(deliveryTag, multiple: false, requeue: false,
                 cancellationToken: cancellationToken);
             return;
@@ -81,8 +88,9 @@ public sealed class OrderStatusMessageHandler(
         if (alreadyProcessed)
         {
             await channel.BasicAckAsync(deliveryTag, multiple: false, cancellationToken: cancellationToken);
-            logger.LogInformation("Skipped duplicate OrderStatusChanged {MessageId} for order {OrderId}",
-                messageId, update.OrderId);
+            logger.LogInformation(
+                "Consumer {ConsumerId} skipped duplicate OrderStatusChanged {MessageId} for order {OrderId} (status: duplicate skipped)",
+                consumerId, messageId, update.OrderId);
             return;
         }
 
@@ -109,6 +117,8 @@ public sealed class OrderStatusMessageHandler(
             // Do not mark the message processed: the retry must do the work again.
             await ScheduleRetryAsync(channel, body, deliveryTag, messageId, properties, retryPublisher,
                 ex, cancellationToken);
+            logger.LogWarning("Consumer {ConsumerId} status update for order {OrderId} (status: retry scheduled)",
+                consumerId, update.OrderId);
             return;
         }
         catch (Exception ex)
@@ -117,8 +127,9 @@ public sealed class OrderStatusMessageHandler(
 
             // Unexpected failures use the bounded DLQ policy: log once and retain
             // the message for inspection instead of retrying forever.
-            logger.LogError(ex, "Status delivery {DeliveryTag} failed permanently; rejecting to {DeadLetterQueue}",
-                deliveryTag, settings.StatusDeadLetterQueue);
+            logger.LogError(ex,
+                "Consumer {ConsumerId} failed status update for order {OrderId} permanently (status: dead-lettered to {DeadLetterQueue})",
+                consumerId, update.OrderId, settings.StatusDeadLetterQueue);
             await channel.BasicNackAsync(deliveryTag, multiple: false, requeue: false,
                 cancellationToken: cancellationToken);
             return;
@@ -127,7 +138,9 @@ public sealed class OrderStatusMessageHandler(
         // A failed acknowledgment has an unknown outcome. Let the worker reconnect;
         // attempting to reject the same delivery could settle it twice.
         await channel.BasicAckAsync(deliveryTag, multiple: false, cancellationToken: cancellationToken);
-        logger.LogInformation("Processed and acknowledged status update for order {OrderId}", update.OrderId);
+        logger.LogInformation(
+            "Consumer {ConsumerId} processed and acknowledged status update for order {OrderId} (status: acknowledged)",
+            consumerId, update.OrderId);
     }
 
     private Task ScheduleRetryAsync(IChannel channel, ReadOnlyMemory<byte> body, ulong deliveryTag,

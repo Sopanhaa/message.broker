@@ -12,6 +12,11 @@ public sealed class RabbitMqSettings
     public string VirtualHost { get; set; } = "/";
     public string QueueName { get; set; } = "orders";
     public int PublishTimeoutSeconds { get; set; } = 10;
+
+    // Number of consumers the worker starts for each queue. Every consumer gets
+    // its own channel and its own prefetch limit, so two consumers can process
+    // two different orders at the same time.
+    public int ConsumerCount { get; set; } = 2;
     public string DeadLetterExchange => $"{QueueName}.dlx";
     public string DeadLetterQueue => $"{QueueName}.dead-letter";
 
@@ -33,8 +38,8 @@ public sealed class RabbitMqSettings
         if (string.IsNullOrWhiteSpace(HostName) || string.IsNullOrWhiteSpace(UserName) ||
             string.IsNullOrWhiteSpace(Password) || string.IsNullOrWhiteSpace(VirtualHost) ||
             string.IsNullOrWhiteSpace(QueueName) || Port is < 1 or > 65535 ||
-            PublishTimeoutSeconds is < 1 or > 300)
-            throw new InvalidOperationException("Check the RabbitMq configuration: host, port, credentials, virtual host, queue and timeout are required.");
+            PublishTimeoutSeconds is < 1 or > 300 || ConsumerCount is < 1 or > 16)
+            throw new InvalidOperationException("Check the RabbitMq configuration: host, port, credentials, virtual host, queue, consumer count (1-16) and timeout are required.");
     }
 
     public ConnectionFactory CreateConnectionFactory() => new()

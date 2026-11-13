@@ -4,7 +4,7 @@ A practical demo of asynchronous messaging with ASP.NET Core, a background worke
 
 ## 1. Project Overview
 
-OrderMessagingSystem accepts orders through a small HTTP API, saves them in SQLite, and publishes an `OrderCreated` message to RabbitMQ. A separate background worker consumes the message, simulates order processing, and updates the order status in the shared database. RabbitMQ is the message broker: it holds messages while the worker is offline and delivers them when the worker reconnects. The API and worker run as independent processes, but they use the same SQLite file and the same RabbitMQ queues. Status updates use a second queue, and failures are handled with retry queues and dead-letter queues (DLQs).
+OrderMessagingSystem accepts orders through a small HTTP API, saves them in SQLite, and publishes an `OrderCreated` message to RabbitMQ. A separate background worker consumes the message, simulates order processing, and updates the order status in the shared database. RabbitMQ is the message broker: it holds messages while the worker is offline and delivers them when the worker reconnects. The API and worker run as independent processes, but they use the same SQLite file and the same RabbitMQ queues. Status updates use a second queue, and failures are handled with retry queues and dead-letter queues (DLQs). The worker uses a **prefetch limit of one** per consumer and **manual acknowledgements**, so a message is acknowledged only after processing succeeds. By default it starts **two consumers** for each queue so messages can be processed in parallel. See Section 16.
 
 The same API also exposes small routing-demo endpoints. They publish demo events through a **fanout exchange** (one copy to every bound queue) and a **topic exchange** (routing-key pattern matching). Routing demo events are not persisted and do not change the order pipeline. See Section 15.
 
@@ -108,7 +108,7 @@ The default configuration works on a local computer. You do not need to edit any
 
 ### RabbitMQ settings
 
-Both `OrderProducer.Api/appsettings.json` and `OrderConsumer.Worker/appsettings.json` contain the same section:
+Both `OrderProducer.Api/appsettings.json` and `OrderConsumer.Worker/appsettings.json` contain a `RabbitMq` section. The worker adds `ConsumerCount`, because only the consumer starts queue consumers:
 
 ```json
 "RabbitMq": {
@@ -118,7 +118,8 @@ Both `OrderProducer.Api/appsettings.json` and `OrderConsumer.Worker/appsettings.
   "Password": "orderdev_password",
   "VirtualHost": "/",
   "QueueName": "orders",
-  "PublishTimeoutSeconds": 10
+  "PublishTimeoutSeconds": 10,
+  "ConsumerCount": 2
 }
 ```
 
@@ -126,7 +127,8 @@ Both `OrderProducer.Api/appsettings.json` and `OrderConsumer.Worker/appsettings.
 - **`orderdev` / `orderdev_password`** are development-only credentials. Do not reuse them on a public server.
 - **`QueueName`** is the base name. The app also uses `orders.status`, the retry queues, and two dead-letter queues.
 - **`PublishTimeoutSeconds`** bounds the whole publish operation—connecting, declaring the topology, and waiting for broker confirmation—before the API returns `503`. Valid values are 1 to 300.
-- **Both files must match.** If the API and worker use different credentials, ports, or queue names, they cannot communicate.
+- **`ConsumerCount`** is worker-only. It controls how many consumers the worker starts for each queue. Valid values are 1 to 16; the default is 2.
+- **The shared values must match.** If the API and worker use different credentials, ports, or queue names, they cannot communicate.
 
 ### Docker Compose settings
 
@@ -194,6 +196,8 @@ Both apps declare the same durable topology on startup or first publish. The bas
 
 Retry queues use a per-queue message TTL and dead-letter an expired message back to its main queue, not to the DLQ. The worker also writes an `x-retry-attempt` header as a second, independent guard, so a lost or stripped `x-death` header cannot silently reset the retry count.
 
+By default the worker runs two consumers for `orders` and two for `orders.status`. Consumers of the same queue compete for messages instead of each receiving a copy. Each consumer has its own channel and `prefetchCount: 1`. See Section 16 for details.
+
 The routing-demo exchanges, queues, and DLQ are separate from the order/status pipeline. They do not change the existing retry schedule or DLQ behavior.
 
 ### Environment variables
@@ -209,6 +213,7 @@ You can override configuration without editing JSON:
 | `RabbitMq__VirtualHost` | `/` |
 | `RabbitMq__QueueName` | `orders` |
 | `RabbitMq__PublishTimeoutSeconds` | `10` |
+| `RabbitMq__ConsumerCount` | `2` (worker only; 1 to 16) |
 | `Database__Path` | `/tmp/orders.db` |
 
 Use a double underscore (`__`) to separate nested keys. On PowerShell, set a variable with `$env:Database__Path="C:\temp\orders.db"`.
@@ -338,10 +343,20 @@ dotnet run --project OrderConsumer.Worker
 Wait for:
 
 ```text
-Waiting for orders in orders and status updates in orders.status; prefetch=1 per queue, manual acknowledgments enabled
+Started consumer order-consumer-1 on orders; prefetch=1, manual acknowledgments enabled
+Started consumer order-consumer-2 on orders; prefetch=1, manual acknowledgments enabled
+Started consumer status-consumer-1 on orders.status; prefetch=1, manual acknowledgments enabled
+Started consumer status-consumer-2 on orders.status; prefetch=1, manual acknowledgments enabled
+Waiting for orders in orders and status updates in orders.status; consumers per queue=2, prefetch=1, manual acknowledgments enabled
 ```
 
-This means the worker connected to RabbitMQ, declared the main queues, retry queues, and dead-letter exchanges, and is waiting for messages.
+This means the worker connected to RabbitMQ, declared the main queues, retry queues, and dead-letter exchanges, and is waiting for messages. Two consumers now compete for messages on each queue. Each consumer has its own channel and may hold at most one unacknowledged message at a time.
+
+To run only one consumer per queue, start the worker with `RabbitMq__ConsumerCount=1`:
+
+```bash
+RabbitMq__ConsumerCount=1 dotnet run --project OrderConsumer.Worker
+```
 
 The worker also starts the routing-demo consumers and logs a second line:
 
@@ -467,14 +482,17 @@ If you get `400 Bad Request`, the response lists the invalid fields. Check `cust
 Switch to **Terminal 3**. Within a second or two you should see:
 
 ```text
+Consumer order-consumer-1 received order <your-order-id> (status: processing)
 Processing order <your-order-id>: customer=Sopanha, total=50.00
 Order product: name=Keyboard, quantity=2, unitPrice=20.00
 Order product: name=Mouse, quantity=1, unitPrice=10.00
 Completed order <your-order-id>
-Processed and acknowledged order <your-order-id>
+Consumer order-consumer-1 processed and acknowledged order <your-order-id> (status: acknowledged)
 ```
 
-**This is example output.** The order ID and timestamps will differ. You may also see EF Core SQL command logs; they are normal.
+**This is example output.** The consumer ID may be `order-consumer-1` or `order-consumer-2`; the order ID and timestamps will differ. You may also see EF Core SQL command logs; they are normal. The ACK line appears only after processing succeeds.
+
+To see distribution, create several orders in a row (repeat Step 5 with different customers, or use the commands in Section 16). With two consumers, the log shows some orders processed by `order-consumer-1` and others by `order-consumer-2`. Each consumer still handles only one unacknowledged order at a time.
 
 ### Step 8 Check RabbitMQ
 
@@ -670,15 +688,15 @@ These unit tests do not need RabbitMQ:
 dotnet test --filter "FullyQualifiedName~OrderConsumerTests|FullyQualifiedName~ProcessingFailureClassifierTests|FullyQualifiedName~RetryHeaderInspectorTests|FullyQualifiedName~RetryPublisherTests|FullyQualifiedName~RabbitMqTopologyTests"
 ```
 
-Expected: **92 passed**.
+Expected: **95 passed**.
 
-These integration tests need RabbitMQ. They check the retry TTLs, the first 5-second retry, retry metadata, fanout broadcast, exact/`*`/`#` topic routing, and multiple consumers:
+These integration tests need RabbitMQ. They check the retry TTLs, the first 5-second retry, retry metadata, fanout broadcast, exact/`*`/`#` topic routing, and two consumers sharing one queue with prefetch=1:
 
 ```bash
 RABBITMQ_INTEGRATION_TESTS=1 dotnet test --filter "FullyQualifiedName~RabbitMqIntegrationTests"
 ```
 
-Expected: **9 passed**.
+Expected: **10 passed**.
 
 The 30-second and 5-minute delays are covered by the schedule and topology unit tests; the integration suite does not wait for them.
 
@@ -693,10 +711,10 @@ dotnet test
 Expected result on a clean run:
 
 ```text
-Passed!  - Failed: 0, Passed: 160, Skipped: 9, Total: 169
+Passed!  - Failed: 0, Passed: 163, Skipped: 10, Total: 173
 ```
 
-**This result was verified on this repository.** The nine skipped tests are the opt-in RabbitMQ integration tests.
+**This result was verified on this repository.** The ten skipped tests are the opt-in RabbitMQ integration tests.
 
 - The default test run **does not need RabbitMQ**.
 - The default tests use temporary SQLite files, and the opt-in integration tests use temporary RabbitMQ queue and exchange names, so they do not touch your local order database or the main queues.
@@ -706,7 +724,7 @@ Passed!  - Failed: 0, Passed: 160, Skipped: 9, Total: 169
   RABBITMQ_INTEGRATION_TESTS=1 dotnet test --filter "FullyQualifiedName~RabbitMqIntegrationTests"
   ```
 
-  Expected: `Passed: 9`.
+  Expected: `Passed: 10`.
 
 On PowerShell:
 
@@ -994,7 +1012,7 @@ The default test run covers API publishing, topology declarations, payload valid
 dotnet test
 ```
 
-Expected: `Passed: 160, Skipped: 9, Total: 169`.
+Expected: `Passed: 163, Skipped: 10, Total: 173`.
 
 The opt-in integration tests verify real broker routing:
 
@@ -1002,9 +1020,9 @@ The opt-in integration tests verify real broker routing:
 RABBITMQ_INTEGRATION_TESTS=1 dotnet test --filter "FullyQualifiedName~RabbitMqIntegrationTests"
 ```
 
-Expected: `Passed: 9`.
+Expected: `Passed: 10`.
 
-They cover fanout copies, exact topic routing, `*` wildcard behavior, `#` catch-all behavior, keys that do not match a specific binding, and two independent consumers.
+They cover fanout copies, exact topic routing, `*` wildcard behavior, `#` catch-all behavior, keys that do not match a specific binding, two independent consumers, and two competing consumers sharing one queue with prefetch=1.
 
 ### Routing troubleshooting
 
@@ -1025,3 +1043,130 @@ They cover fanout copies, exact topic routing, `*` wildcard behavior, `#` catch-
 - The routing consumers use a separate RabbitMQ connection from the order/status consumers. This is intentional so demo traffic cannot delay order processing.
 - The audit queue receives every topic message because of the `#` binding.
 - The demo publishes with `mandatory: true`. If an exchange has no matching queue, the API returns `503` instead of silently dropping the event.
+
+## 16. Consumer Prefetch and Multiple Consumers
+
+This section explains how the worker controls message delivery. The behaviour applies to the order queue (`orders`), the status queue (`orders.status`), and their retry/DLQ flow.
+
+### What prefetch means
+
+`prefetchCount` is the maximum number of **unacknowledged** messages a consumer may hold at once. The worker sets it in `OrderConsumer.Worker/Worker.cs`:
+
+```csharp
+await channel.BasicQosAsync(prefetchSize: 0, prefetchCount: 1, global: false,
+    cancellationToken: stoppingToken);
+```
+
+- `prefetchCount: 1` means RabbitMQ sends at most one message to that consumer, then waits for an ACK or NACK before sending another.
+- `global: false` means the limit applies to each consumer channel separately. It is not a shared limit for the whole connection.
+- With two consumers, the queue can have up to two messages in flight (one per consumer), but neither consumer gets a second message until it settles the first.
+- A slower consumer does not receive a large backlog, so other consumers can keep taking work.
+
+### Manual acknowledgements
+
+Both order and status consumers are started with `autoAck: false`. The handler settles each delivery explicitly:
+
+| Result | Broker operation | When it happens |
+| --- | --- | --- |
+| Processing succeeded | `BasicAckAsync` | After the processor finishes and the deduplication row is saved |
+| Invalid payload | `BasicNackAsync(requeue: false)` | Sent to the DLQ; retrying cannot fix bad data |
+| Permanent processing failure | `BasicNackAsync(requeue: false)` | Sent to the DLQ |
+| Transient failure | Retry publish, then `BasicAckAsync` | The original is ACKed only after the retry publish is confirmed |
+| Retry publish not confirmed | No settlement | The worker reconnects and RabbitMQ redelivers the original |
+| Shutdown or cancellation | No settlement | The channel closes and RabbitMQ requeues the message |
+
+Acknowledging after processing is the important rule: if the process crashes before the ACK, RabbitMQ delivers the message again. The existing `ProcessedMessages` table makes that redelivery safe.
+
+### Multiple consumers on one queue
+
+`Worker.cs` starts `RabbitMq:ConsumerCount` consumers for each queue. Each consumer gets:
+
+- its own `IChannel`,
+- its own `BasicQosAsync` call with prefetch `1`,
+- its own `AsyncEventingBasicConsumer`, and
+- a stable ID such as `order-consumer-1` or `order-consumer-2` for logs.
+
+Consumers on the **same queue compete**: RabbitMQ round-robins messages between them, so each message is processed once. This is different from the fanout demo, where each queue receives its own copy.
+
+The default is `2`:
+
+```json
+"RabbitMq": {
+  "ConsumerCount": 2
+}
+```
+
+To change it without editing JSON:
+
+```bash
+RabbitMq__ConsumerCount=3 dotnet run --project OrderConsumer.Worker
+```
+
+Valid values are `1` to `16`. Setting it to `1` keeps the old single-consumer behaviour. You can also start a second worker process against the same RabbitMQ queue; both processes then act as separate competing consumers. If you do that, make sure both processes use the same `Database__Path` and do not run them in separate Docker containers that write the same SQLite file.
+
+### Run and observe two consumers
+
+1. Start RabbitMQ, the API, and the worker as described in Sections 5, 7, and 8.
+2. Confirm the worker log contains `Started consumer order-consumer-1` and `Started consumer order-consumer-2`.
+3. Send several orders quickly:
+
+   ```bash
+   for i in 1 2 3 4 5 6; do
+     curl -s -X POST http://localhost:5000/orders \
+       -H 'Content-Type: application/json' \
+       -d "{\"customerName\":\"Prefetch Demo $i\",\"totalAmount\":10}" >/dev/null
+   done
+   ```
+
+4. Watch the worker terminal. You should see both IDs:
+
+   ```text
+   Consumer order-consumer-1 received order <id-1> (status: processing)
+   Consumer order-consumer-2 received order <id-2> (status: processing)
+   Consumer order-consumer-2 processed and acknowledged order <id-2> (status: acknowledged)
+   Consumer order-consumer-1 processed and acknowledged order <id-1> (status: acknowledged)
+   ```
+
+   The exact split depends on timing, but with several messages both consumers participate. Each `received` line is followed by exactly one acknowledged, retry, or dead-letter line for that order.
+
+5. Inspect the queue in the Management UI at **http://localhost:15673** → **Queues and Streams** → `orders`. The queue shows two consumers. While messages are being processed, **Unacked** is normally `1` or `2`—one per busy consumer—not the size of the whole backlog.
+
+6. Stop the worker with `Ctrl+C` while messages are in flight. Any unacknowledged deliveries return to `orders` and are processed after restart; they are not lost.
+
+### Verify the prefetch setting in the Management UI
+
+Open `orders` → **Consumers**. Each consumer shows its consumer tag and channel. The channel details show `prefetch_count = 1`. With `ConsumerCount=2`, the queue lists two consumers and can have at most two unacknowledged messages.
+
+### Automated tests
+
+The normal unit test run verifies the configuration and the existing handler settlement rules:
+
+```bash
+dotnet test
+```
+
+Expected: `Passed: 163, Skipped: 10, Total: 173`.
+
+The opt-in integration test connects two consumers to one temporary queue and publishes ten messages. It checks that:
+
+- both consumers receive messages,
+- every message is received exactly once, and
+- each consumer never handles more than one unacknowledged message at a time.
+
+```bash
+RABBITMQ_INTEGRATION_TESTS=1 dotnet test --filter "FullyQualifiedName~Two_consumers_with_prefetch_one"
+```
+
+Expected: `Passed: 1`.
+
+To run all integration tests:
+
+```bash
+RABBITMQ_INTEGRATION_TESTS=1 dotnet test --filter "FullyQualifiedName~RabbitMqIntegrationTests"
+```
+
+Expected: `Passed: 10`.
+
+### Retry and DLQ behaviour is unchanged
+
+Multiple consumers do not change the retry or dead-letter topology. Transient failures still publish to `orders.retry.5s`, `orders.retry.30s`, and `orders.retry.5m` (and the matching status queues), then return to the main queue. Permanent failures and exhausted retries still go to the dead-letter queue. The original delivery is ACKed only after the retry publish is confirmed, and unacknowledged messages are requeued on shutdown or connection loss.

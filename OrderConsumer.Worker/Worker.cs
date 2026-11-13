@@ -10,6 +10,10 @@ public sealed class Worker(
 {
     private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(5);
 
+    // Each consumer may hold at most one unacknowledged message. RabbitMQ will
+    // not send the next message on that channel until this one is ACKed or NACKed.
+    private const int PrefetchCount = 1;
+
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
         try
@@ -46,14 +50,13 @@ public sealed class Worker(
         using var session = CancellationTokenSource.CreateLinkedTokenSource(stoppingToken);
         await using var connection = await settings.CreateConnectionFactory().CreateConnectionAsync(stoppingToken);
 
-        // Each consumer owns its channel, and the retry publisher owns a separate
+        // Every consumer owns its channel, and the retry publisher owns a separate
         // confirm-enabled channel. No channel is shared by concurrent operations.
-        await using var orderChannel = await connection.CreateChannelAsync(cancellationToken: stoppingToken);
-        await using var statusChannel = await connection.CreateChannelAsync(cancellationToken: stoppingToken);
         await using var retryChannel = await connection.CreateChannelAsync(new CreateChannelOptions(
             publisherConfirmationsEnabled: true,
             publisherConfirmationTrackingEnabled: true), stoppingToken);
         var retryPublisher = new RabbitMqRetryPublisher(retryChannel, retryLogger);
+        var consumerChannels = new List<IChannel>();
         var disconnected = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
         Task OnShutdownAsync(object sender, ShutdownEventArgs reason)
@@ -65,27 +68,29 @@ public sealed class Worker(
         }
 
         connection.ConnectionShutdownAsync += OnShutdownAsync;
-        orderChannel.ChannelShutdownAsync += OnShutdownAsync;
-        statusChannel.ChannelShutdownAsync += OnShutdownAsync;
         retryChannel.ChannelShutdownAsync += OnShutdownAsync;
 
         try
         {
-            await RabbitMqTopology.DeclareAsync(orderChannel, settings, stoppingToken);
-            await orderChannel.BasicQosAsync(prefetchSize: 0, prefetchCount: 1, global: false,
-                cancellationToken: stoppingToken);
-            await statusChannel.BasicQosAsync(prefetchSize: 0, prefetchCount: 1, global: false,
-                cancellationToken: stoppingToken);
+            // Declare the topology once on a short-lived channel. Doing this before
+            // starting consumers guarantees every consumer sees the same queues.
+            await using (var topologyChannel =
+                         await connection.CreateChannelAsync(cancellationToken: stoppingToken))
+            {
+                await RabbitMqTopology.DeclareAsync(topologyChannel, settings, stoppingToken);
+            }
 
             AsyncEventingBasicConsumer CreateConsumer(IChannel consumerChannel, string queueName,
-                Func<IChannel, ReadOnlyMemory<byte>, IReadOnlyBasicProperties?, string?, ulong, CancellationToken,
-                    Task> handle)
+                string consumerId,
+                Func<IChannel, ReadOnlyMemory<byte>, IReadOnlyBasicProperties?, string?, ulong, string,
+                    CancellationToken, Task> handle)
             {
                 var consumer = new AsyncEventingBasicConsumer(consumerChannel);
                 consumer.UnregisteredAsync += (_, _) =>
                 {
                     if (!stoppingToken.IsCancellationRequested)
-                        logger.LogWarning("Consumer was cancelled; reconnecting to queue {Queue}", queueName);
+                        logger.LogWarning("Consumer {ConsumerId} was cancelled; reconnecting to queue {Queue}",
+                            consumerId, queueName);
                     disconnected.TrySetResult();
                     return Task.CompletedTask;
                 };
@@ -94,36 +99,61 @@ public sealed class Worker(
                     try
                     {
                         await handle(consumerChannel, message.Body, message.BasicProperties,
-                            message.BasicProperties.MessageId, message.DeliveryTag, session.Token);
+                            message.BasicProperties.MessageId, message.DeliveryTag, consumerId, session.Token);
                     }
                     catch (OperationCanceledException) when (session.IsCancellationRequested) { }
                     catch (Exception ex)
                     {
                         logger.LogWarning(ex,
-                            "Could not settle delivery {DeliveryTag} from {Queue}; reconnecting. The message may be redelivered.",
-                            message.DeliveryTag, queueName);
+                            "Consumer {ConsumerId} could not settle delivery {DeliveryTag} from {Queue}; reconnecting. The message may be redelivered.",
+                            consumerId, message.DeliveryTag, queueName);
                         disconnected.TrySetResult();
                     }
                 };
                 return consumer;
             }
 
-            var orderConsumer = CreateConsumer(orderChannel, settings.QueueName,
-                (channel, body, properties, messageId, deliveryTag, token) =>
-                    orderHandler.HandleAsync(channel, body, deliveryTag, token, messageId, properties,
-                        retryPublisher));
-            var statusConsumer = CreateConsumer(statusChannel, settings.StatusQueueName,
-                (channel, body, properties, messageId, deliveryTag, token) =>
-                    statusHandler.HandleAsync(channel, body, deliveryTag, token, messageId, properties,
-                        retryPublisher));
+            async Task StartConsumersAsync(string queueName, string consumerIdPrefix,
+                Func<IChannel, ReadOnlyMemory<byte>, IReadOnlyBasicProperties?, string?, ulong, string,
+                    CancellationToken, Task> handle)
+            {
+                // Several consumers can share one queue. RabbitMQ round-robins
+                // messages between them, and each consumer has its own channel.
+                for (var index = 1; index <= settings.ConsumerCount; index++)
+                {
+                    var channel = await connection.CreateChannelAsync(cancellationToken: stoppingToken);
+                    consumerChannels.Add(channel);
+                    channel.ChannelShutdownAsync += OnShutdownAsync;
 
-            await orderChannel.BasicConsumeAsync(settings.QueueName, autoAck: false, consumer: orderConsumer,
-                cancellationToken: stoppingToken);
-            await statusChannel.BasicConsumeAsync(settings.StatusQueueName, autoAck: false, consumer: statusConsumer,
-                cancellationToken: stoppingToken);
+                    // Prefetch applies per channel: at most one unacknowledged message here.
+                    await channel.BasicQosAsync(prefetchSize: 0, prefetchCount: PrefetchCount,
+                        global: false, cancellationToken: stoppingToken);
+
+                    var consumerId = $"{consumerIdPrefix}-{index}";
+                    var consumer = CreateConsumer(channel, queueName, consumerId, handle);
+
+                    // autoAck=false: the handler decides when to ACK or NACK.
+                    await channel.BasicConsumeAsync(queueName, autoAck: false, consumer: consumer,
+                        cancellationToken: stoppingToken);
+
+                    logger.LogInformation(
+                        "Started consumer {ConsumerId} on {Queue}; prefetch={PrefetchCount}, manual acknowledgments enabled",
+                        consumerId, queueName, PrefetchCount);
+                }
+            }
+
+            await StartConsumersAsync(settings.QueueName, "order-consumer",
+                (channel, body, properties, messageId, deliveryTag, consumerId, token) =>
+                    orderHandler.HandleAsync(channel, body, deliveryTag, token, messageId, properties,
+                        retryPublisher, consumerId));
+            await StartConsumersAsync(settings.StatusQueueName, "status-consumer",
+                (channel, body, properties, messageId, deliveryTag, consumerId, token) =>
+                    statusHandler.HandleAsync(channel, body, deliveryTag, token, messageId, properties,
+                        retryPublisher, consumerId));
+
             logger.LogInformation(
-                "Waiting for orders in {Queue} and status updates in {StatusQueue}; prefetch=1 per queue, manual acknowledgments enabled",
-                settings.QueueName, settings.StatusQueueName);
+                "Waiting for orders in {Queue} and status updates in {StatusQueue}; consumers per queue={ConsumerCount}, prefetch={PrefetchCount}, manual acknowledgments enabled",
+                settings.QueueName, settings.StatusQueueName, settings.ConsumerCount, PrefetchCount);
             await disconnected.Task.WaitAsync(stoppingToken);
         }
         finally
@@ -131,9 +161,13 @@ public sealed class Worker(
             // Stop in-flight work before disposing the channels and requeuing unfinished deliveries.
             await session.CancelAsync();
             connection.ConnectionShutdownAsync -= OnShutdownAsync;
-            orderChannel.ChannelShutdownAsync -= OnShutdownAsync;
-            statusChannel.ChannelShutdownAsync -= OnShutdownAsync;
             retryChannel.ChannelShutdownAsync -= OnShutdownAsync;
+
+            foreach (var channel in consumerChannels)
+            {
+                channel.ChannelShutdownAsync -= OnShutdownAsync;
+                await channel.DisposeAsync();
+            }
         }
     }
 }

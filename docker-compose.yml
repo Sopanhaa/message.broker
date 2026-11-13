@@ -65,6 +65,7 @@ services:
       RabbitMq__VirtualHost: /
       RabbitMq__QueueName: orders
       RabbitMq__PublishTimeoutSeconds: "10"
+      RabbitMq__ConsumerCount: "2"
       Database__Path: /data/orders.db
     volumes:
       - orders_data:/data

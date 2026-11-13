@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net.Http.Headers;
 using System.Text;
@@ -5,6 +6,7 @@ using System.Text.Json;
 using Microsoft.Extensions.Logging.Abstractions;
 using OrderConsumer.Worker;
 using RabbitMQ.Client;
+using RabbitMQ.Client.Events;
 using Shared.Contracts.Messaging;
 
 namespace OrderMessagingSystem.Tests;
@@ -63,6 +65,80 @@ public sealed class RabbitMqIntegrationTests
         finally
         {
             await BestEffortDeleteAsync(channel, settings);
+        }
+    }
+
+    [RabbitMqIntegrationFact]
+    public async Task Two_consumers_with_prefetch_one_share_the_same_queue()
+    {
+        const int messageCount = 10;
+        var settings = CreateSettings();
+        await using var connection = await ConnectAsync(settings);
+        await using var setupChannel = await connection.CreateChannelAsync();
+        await using var firstChannel = await connection.CreateChannelAsync();
+        await using var secondChannel = await connection.CreateChannelAsync();
+
+        try
+        {
+            await RabbitMqTopology.DeclareAsync(setupChannel, settings, CancellationToken.None);
+
+            var receivedBy = new ConcurrentDictionary<string, string>();
+            var active = new ConcurrentDictionary<string, int>();
+            var maxActive = new ConcurrentDictionary<string, int>();
+            var receivedTotal = 0;
+            var allReceived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            async Task StartConsumerAsync(IChannel channel, string consumerId)
+            {
+                // Same settings as the worker: one unacknowledged message per consumer.
+                await channel.BasicQosAsync(prefetchSize: 0, prefetchCount: 1, global: false);
+                var consumer = new AsyncEventingBasicConsumer(channel);
+                consumer.ReceivedAsync += async (_, message) =>
+                {
+                    var current = active.AddOrUpdate(consumerId, 1, (_, value) => value + 1);
+                    maxActive.AddOrUpdate(consumerId, current,
+                        (_, value) => Math.Max(value, current));
+
+                    // Keep the delivery unacknowledged long enough for the other
+                    // consumer to receive work too.
+                    await Task.Delay(TimeSpan.FromMilliseconds(100));
+
+                    receivedBy[message.BasicProperties.MessageId!] = consumerId;
+                    await channel.BasicAckAsync(message.DeliveryTag, multiple: false);
+                    active.AddOrUpdate(consumerId, 0, (_, value) => value - 1);
+
+                    if (Interlocked.Increment(ref receivedTotal) == messageCount)
+                        allReceived.TrySetResult();
+                };
+
+                // autoAck=false because this test also exercises manual settlement.
+                await channel.BasicConsumeAsync(settings.QueueName, autoAck: false, consumer: consumer);
+            }
+
+            await StartConsumerAsync(firstChannel, "consumer-1");
+            await StartConsumerAsync(secondChannel, "consumer-2");
+
+            for (var index = 0; index < messageCount; index++)
+            {
+                var properties = new BasicProperties
+                {
+                    Persistent = true,
+                    MessageId = $"prefetch-message-{index}"
+                };
+                await setupChannel.BasicPublishAsync(exchange: "", routingKey: settings.QueueName,
+                    mandatory: true, basicProperties: properties, body: "{}"u8.ToArray());
+            }
+
+            await allReceived.Task.WaitAsync(TimeSpan.FromSeconds(15));
+
+            Assert.Equal(messageCount, receivedBy.Count);
+            Assert.Contains("consumer-1", receivedBy.Values);
+            Assert.Contains("consumer-2", receivedBy.Values);
+            Assert.All(maxActive.Values, observed => Assert.Equal(1, observed));
+        }
+        finally
+        {
+            await BestEffortDeleteAsync(setupChannel, settings);
         }
     }
 
