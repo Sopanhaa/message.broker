@@ -1170,3 +1170,196 @@ Expected: `Passed: 10`.
 ### Retry and DLQ behaviour is unchanged
 
 Multiple consumers do not change the retry or dead-letter topology. Transient failures still publish to `orders.retry.5s`, `orders.retry.30s`, and `orders.retry.5m` (and the matching status queues), then return to the main queue. Permanent failures and exhausted retries still go to the dead-letter queue. The original delivery is ACKed only after the retry publish is confirmed, and unacknowledged messages are requeued on shutdown or connection loss.
+
+## 17. RabbitMQ Restart and Recovery Test Results
+
+This section records a real test run, not a plan. Commands were executed against the local Docker broker on **2026-11-16**. Results are labelled **PASS**, **FAIL**, or **NOT RUN**. A `NOT RUN` result means the step was deliberately skipped and is not a claim of success.
+
+### Test environment
+
+| Item | Value |
+| --- | --- |
+| OS | Linux |
+| .NET SDK | `10.0.115` |
+| Broker image | `rabbitmq:4.2-management` |
+| Docker / Compose | `29.9.3` / `v5.6.1` |
+| AMQP endpoint | `localhost:5673` |
+| Management UI | `http://localhost:15673` |
+| Test database | `/tmp/opencode/mqtest/orders.db` (both API and worker) |
+| Worker consumers | `2` per queue, `prefetch=1` |
+| Source changes | None required for this test run |
+
+Both the API and the worker were started with the same `Database__Path` so they shared one SQLite file:
+
+```bash
+Database__Path=/tmp/opencode/mqtest/orders.db dotnet run --project OrderProducer.Api
+Database__Path=/tmp/opencode/mqtest/orders.db dotnet run --project OrderConsumer.Worker
+```
+
+### Results summary
+
+| # | Test | Expected | Actual | Result |
+| --- | --- | --- | --- | --- |
+| 1 | `dotnet build` | 0 warnings, 0 errors | Build succeeded, 0 warnings, 0 errors | **PASS** |
+| 2 | Broker reachable and healthy | `docker compose ps` shows healthy | `Up ... (healthy)` on port `5673` | **PASS** |
+| 3 | Worker startup | 2 order + 2 status consumers, prefetch 1 | `order-consumer-1/2`, `status-consumer-1/2`, `prefetch=1` | **PASS** |
+| 4 | Baseline publish + ACK | Order accepted, processed, `Completed` | 3/3 orders `Completed`, 3 ACKs logged | **PASS** |
+| 5 | Invalid payload → NACK → DLQ | Message rejected to `orders.dead-letter` | `x-death.reason=rejected`; DLQ count 1 | **PASS** |
+| 6 | Transient failure → retry queue | `retry 1/3` in `orders.status.retry.5s`, then success | Retry logged, then status updated to `Failed` | **PASS** |
+| 7 | Retry exhaustion → DLQ | After attempt 3, reject to DLQ | `exhausted 3 retry attempts`; DLQ count 2 | **PASS** |
+| 8 | Duplicate delivery | ACK as duplicate, no reprocessing | `duplicate skipped`, no second processing | **PASS** |
+| 9 | Consumer offline, queue retention | Messages wait in queue, then process on restart | `Ready: 3`, `consumers: 0`; all 3 processed after restart | **PASS** |
+| 10 | Default automated tests | 163 passed, 10 skipped | `Failed: 0, Passed: 163, Skipped: 10` | **PASS** |
+| 11 | RabbitMQ integration tests | 10 passed | `Failed: 0, Passed: 10` | **PASS** |
+| 12 | Stop RabbitMQ, restart, verify broker durability | Queues and messages survive restart | Restart was declined by the operator | **NOT RUN** |
+| 13 | Consumer automatic reconnect after broker restart | Worker logs reconnect and resumes | Not executed (depends on test 12) | **NOT RUN** |
+| 14 | Unacknowledged in-flight message redelivered after broker restart | Message returns to `orders` and is ACKed after reconnect | Not executed (depends on test 12) | **NOT RUN** |
+
+**Overall: 11 executed tests PASS, 0 FAIL, 3 NOT RUN.** The broker was not restarted, so no result in this section claims that restart recovery was verified.
+
+### What was actually observed
+
+**Baseline ACK (tests 3–4).** The worker received and settled all three orders:
+
+```text
+Started consumer order-consumer-1 on orders; prefetch=1, manual acknowledgments enabled
+Started consumer order-consumer-2 on orders; prefetch=1, manual acknowledgments enabled
+Started consumer status-consumer-1 on orders.status; prefetch=1, manual acknowledgments enabled
+Started consumer status-consumer-2 on orders.status; prefetch=1, manual acknowledgments enabled
+Consumer order-consumer-2 processed and acknowledged order 5639c0ab-... (status: acknowledged)
+Consumer order-consumer-1 processed and acknowledged order e844f49f-... (status: acknowledged)
+Consumer order-consumer-2 processed and acknowledged order fbdd17db-... (status: acknowledged)
+```
+
+**NACK to DLQ (test 5).** An invalid JSON payload was published to `orders` through the Management API. The worker rejected it without requeue:
+
+```text
+Consumer order-consumer-2 rejected delivery 3 with an invalid payload (status: dead-lettered to orders.dead-letter)
+```
+
+Peeking at `orders.dead-letter` showed the original payload with:
+
+```json
+"headers": {
+  "x-death": [
+    { "queue": "orders", "reason": "rejected", "count": 1 }
+  ]
+}
+```
+
+**Retry queue (test 6).** A SQLite `BEGIN EXCLUSIVE` transaction held the database write lock. A valid `OrderStatusChanged` message was published directly to `orders.status` through the Management API, because a `PATCH` request would itself need the locked database. The worker hit the 5-second SQLite busy timeout, published to the retry queue, ACKed the original, and later applied the update:
+
+```text
+Consumer status-consumer-1 received status update for order 0ec06a82-... (status: processing)
+Delivery 1 failed transiently; scheduled retry 1/3 in orders.status.retry.5s after 5 seconds
+Consumer status-consumer-2 received status update for order 0ec06a82-... (status: processing)
+Order 0ec06a82-... status updated to Failed: retry demo
+Consumer status-consumer-2 processed and acknowledged status update for order 0ec06a82-... (status: acknowledged)
+```
+
+`orders.status.retry.5s` drained back to `messages=0`, and `GET /orders/{id}` returned `"status": "Failed"`.
+
+**Retry exhaustion (test 7).** A valid order message was published with the header `x-retry-attempt: 3` while the database lock was held. The transient failure took the retry index past the last stage, so the worker NACKed it to the DLQ:
+
+```text
+Delivery 4 exhausted 3 retry attempts; rejecting to orders.dead-letter
+```
+
+`orders.dead-letter` reached `messages=2`.
+
+**Duplicate delivery (test 8).** The already-processed `OrderCreated` message was published again with the same `MessageId`. The worker found it in `ProcessedMessages`, ACKed it, and did no work:
+
+```text
+Consumer order-consumer-1 skipped duplicate OrderCreated e844f49f-... for order e844f49f-... (status: duplicate skipped)
+```
+
+**Consumer offline and restart (test 9).** The worker was stopped gracefully (`consumers: 0`). Three orders were published while it was down. The queue reported `Ready: 3` once the management counters refreshed. After the worker restarted, all three were received, processed, and ACKed, and all three orders were `Completed`.
+
+### Automated tests
+
+```bash
+dotnet test OrderMessagingSystem.slnx --no-build
+# Failed: 0, Passed: 163, Skipped: 10, Total: 173
+
+RABBITMQ_INTEGRATION_TESTS=1 dotnet test OrderMessagingSystem.slnx --no-build \
+  --filter "FullyQualifiedName~RabbitMqIntegrationTests|FullyQualifiedName~RoutingRabbitMqIntegrationTests"
+# Failed: 0, Passed: 10, Skipped: 0, Total: 10
+```
+
+The integration tests used temporary queue and exchange names, so they did not consume the test messages above.
+
+### Automatic connection recovery: code review
+
+The client library's built-in recovery is intentionally **disabled**:
+
+```csharp
+// Shared.Contracts/Messaging/RabbitMqSettings.cs
+AutomaticRecoveryEnabled = false,
+RequestedConnectionTimeout = TimeSpan.FromSeconds(5),
+ContinuationTimeout = TimeSpan.FromSeconds(10),
+RequestedHeartbeat = TimeSpan.FromSeconds(15)
+```
+
+Recovery is implemented by application code instead:
+
+- **Worker reconnect loop.** `Worker.ExecuteAsync` calls `ConsumeUntilDisconnectedAsync` in a `while` loop. Any connection or channel loss completes a `TaskCompletionSource`, the session is cancelled, channels are disposed, and the loop waits 5 seconds before reconnecting and re-declaring the topology.
+- **Shutdown detection.** `connection.ConnectionShutdownAsync`, `retryChannel.ChannelShutdownAsync`, each `channel.ChannelShutdownAsync`, and `consumer.UnregisteredAsync` all signal the disconnect.
+- **Unacknowledged work.** Deliveries are settled manually. On disconnect the handler returns without ACK/NACK, so RabbitMQ requeues the message for the next connection.
+- **Publisher reconnect.** `RabbitMqPublisher` checks `IsOpen` before each publish, disposes a broken channel/connection, and creates a fresh connection plus topology on the next request. A failed publish returns `503`.
+- **Idempotency.** `ProcessedMessages` and timestamp-guarded status writes make redelivery safe.
+
+The **live** reconnect path (worker surviving an actual broker stop/start) was **not executed** in this run because the restart was declined. It must not be treated as verified.
+
+### How to run the pending restart tests
+
+When a broker restart is acceptable, run these steps from the repository root. The named volume `rabbitmq_data` is preserved by both commands, so this does not delete queued messages.
+
+1. Keep the API and worker running, and publish a few orders.
+2. Stop the worker so messages stay in `orders`:
+
+   ```bash
+   # In the worker terminal: Ctrl+C
+   ```
+
+3. Publish 3 orders while the worker is stopped. Confirm `orders` shows `Ready: 3` and `consumers: 0`.
+4. Stop and start only the broker container:
+
+   ```bash
+   docker compose stop rabbitmq
+   docker compose start rabbitmq
+   docker compose ps          # wait for healthy
+   ```
+
+5. Recheck the queue before starting the worker. Expected: `orders` still shows `Ready: 3`, proving durable queues and persistent messages survived the broker restart.
+6. Start the worker:
+
+   ```bash
+   dotnet run --project OrderConsumer.Worker
+   ```
+
+   Expected: the worker connects, logs `Started consumer ...`, and processes all three orders. This verifies broker-restart durability and consumer recovery.
+7. To test in-flight redelivery, hold the database lock as in test 6, publish a status update, and stop the broker while the delivery is unacknowledged. Restart the broker, release the lock, and confirm the worker logs a redelivery followed by an ACK. Expected on reconnect:
+
+   ```text
+   Consumer connection or channel closed: ...
+   Reconnecting to RabbitMQ in 5 seconds
+   Started consumer order-consumer-1 on orders; prefetch=1, manual acknowledgments enabled
+   Consumer order-consumer-1 processed and acknowledged ...
+   ```
+
+8. If you ever want to discard the two test DLQ messages and the test database, remove them explicitly:
+
+   ```bash
+   # Purge only the test DLQ through the Management UI, or:
+   curl -u orderdev:orderdev_password -X DELETE \
+     http://localhost:15673/api/queues/%2F/orders.dead-letter/contents
+   rm -f /tmp/opencode/mqtest/orders.db*
+   ```
+
+### Limitations of this run
+
+- The broker restart itself was **not** performed, so tests 12–14 remain **NOT RUN**.
+- The retry test used a direct Management API publish to `orders.status` to avoid the API's own database read. This still exercises the real consumer, retry publisher, retry TTL, and DLQ topology.
+- The retry-exhaustion test injected `x-retry-attempt: 3` to reach the last stage without waiting 5 minutes. The 5-second retry itself was exercised normally; the 30-second and 5-minute delays were not waited out.
+- Management UI counters can lag a few seconds. Queue counts were re-read after a short delay before recording results.
+- The worker and API were stopped at the end of the run. The `orders.dead-letter` queue still contains the two test messages until purged.
